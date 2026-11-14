@@ -1,0 +1,7 @@
+# local config (never commit real values)
+local.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

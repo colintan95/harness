@@ -1,5 +1,5 @@
 """
-tunnel.py – SSH port-forwarding and the remote-tools lifecycle.
+remote.py – SSH port-forwarding and the remote-tools lifecycle.
 
 This module owns everything that reaches a remote host over the system
 ``ssh`` binary:
@@ -12,8 +12,9 @@ This module owns everything that reaches a remote host over the system
 * :class:`OllamaTunnel`, which forwards a local port to a remote Ollama
   daemon via ``ssh -L ... -N``; and
 * :class:`RemoteTools`, which forwards a local port *and* runs
-  ``python3 ~/tools.py`` as the remote command over one ``ssh -L``
-  session.
+  ``python3 ~/tools/tools.py`` as the remote command over one ``ssh -L``
+  session, first ensuring the server's Python dependencies are installed on
+  the VM (idempotently).
 
 ``harness.py`` is the application layer (the chat REPL + CLI) and uses
 these.
@@ -64,9 +65,13 @@ def _load_local_env(path: str) -> dict[str, str]:
     return env
 
 
-_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_DIR = os.path.dirname(_SRC_DIR)
+# remote.py lives at <project>/harness/remote.py, so the project root is one
+# level up.  The tools folder (deployed to the VM) sits at the project root,
+# next to the harness package.
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))   # <project>/harness
+_PROJECT_DIR = os.path.dirname(_PKG_DIR)                # <project>
 _LOCAL_ENV = _load_local_env(os.path.join(_PROJECT_DIR, "env", "local.env"))
+_TOOLS_DIR = os.path.join(_PROJECT_DIR, "tools")        # <project>/tools
 
 
 # ---------------------------------------------------------------------------
@@ -149,16 +154,46 @@ class VMSSHConfig(SSHConnection):
 # Remote tools configuration
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class ToolDependency:
+    """
+    A Python dependency the remote ``tools.py`` server needs *on the VM*.
+
+    The pip distribution name and the import name are stored separately
+    because they differ for some packages (here: pip installs
+    ``duckduckgo-search`` but the module is imported as ``ddgs``):
+
+    * *requirement* – the pip spec used to install it when it is missing
+      (e.g. ``"duckduckgo-search"``).
+    * *import_name* – the module probed to detect whether it is already
+      installed (e.g. ``"ddgs"``); a successful ``import`` means "reuse the
+      existing install".
+    """
+    requirement: str
+    import_name: str
+
+
 @dataclass
 class ToolsConfig:
     """
-    TCP ports for the remote ``tools.py`` RPC server.
+    Configuration for the remote ``tools.py`` RPC server.
 
     * *remote_port* – the port ``tools.py`` listens on (on the VM).
     * *local_port*  – the local port the harness forwards to via ``ssh -L``.
+    * *dependencies* – the Python packages the server imports on the VM.
+      The harness ensures each is installed *on the VM* before starting the
+      server, installing only the ones that are missing so a later run reuses
+      the existing installation (see
+      :meth:`RemoteTools._ensure_dependencies`).
     """
     remote_port: int = int(_LOCAL_ENV.get("TOOLS_REMOTE_PORT", "18435"))
     local_port: int = int(_LOCAL_ENV.get("TOOLS_LOCAL_PORT", "18436"))
+    dependencies: tuple[ToolDependency, ...] = (
+        # duckduckgo-search backs the web-search tool; its import name is
+        # "ddgs".  Installed on the VM on first run, reused on every run
+        # afterwards.
+        ToolDependency(requirement="ddgs", import_name="ddgs"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -326,16 +361,29 @@ class OllamaTunnel:
 # Remote tools – deploy tools.py to the VM and manage its lifecycle
 # ---------------------------------------------------------------------------
 
+# The minimum Python version the VM's python3 must be for the tools server.
+_MIN_PYTHON_VERSION: tuple[int, int] = (3, 12)
+
+# The Python interpreter path on the VM.  An absolute path avoids
+# PATH surprises on the remote host.
+_PYTHON_BIN = "/Library/Frameworks/Python.framework/Versions/3.15/bin/python3"
+
 class RemoteTools:
     """
-    Deploy ``tools.py`` to the VM and run it as a direct (non-nohup) RPC
-    server tied to the SSH connection, so it cannot outlive the harness.
+    Deploy the ``tools/`` folder to the VM and run its ``tools.py`` server as a
+    direct (non-nohup) RPC process tied to the SSH connection, so it cannot
+    outlive the harness.
 
-    * :meth:`start` copies ``tools.py`` to ``~`` on the VM and opens a
+    * :meth:`start` copies the whole ``tools/`` folder to ``~/tools`` on the
+      VM, ensures the server's Python dependencies are installed on the VM
+      (installing only what is missing so later runs reuse it), and opens a
       single ``ssh -L`` connection that both forwards a local port and runs
-      ``python3 ~/tools.py`` as the remote command.
+      ``python3 ~/tools/tools.py`` as the remote command.
     * :meth:`call` connects through the forward and sends a JSON-RPC
       request, returning the ``result`` value.
+    * :meth:`get_manifest` asks the server for its tool manifest — one entry per tool (in Ollama's "tools" shape), each with its own
+      name, description, and parameters — so the harness can surface it to
+      the model and forward each tool call back through :meth:`call`.
     * :meth:`stop` (or the context-manager ``__exit__``) first asks the
       remote ``tools.py`` to shut down and waits for its confirmation,
       then closes the SSH session as a backstop.
@@ -343,7 +391,7 @@ class RemoteTools:
     Usage::
 
         with RemoteTools(vm_cfg, tools_cfg) as tools:
-            greeting = tools.call("hello")   # -> "Hello, World!"
+            greeting = tools.call("hello")                # -> "Hello, World!"
     """
 
     def __init__(
@@ -356,8 +404,8 @@ class RemoteTools:
         self._local_port = self._tools_cfg.local_port
         self._remote_port = self._tools_cfg.remote_port
         self._tunnel: Optional[subprocess.Popen[Any]] = None
-        # Path to the local tools.py that gets copied to the VM.
-        self._tools_path = os.path.join(_SRC_DIR, "tools.py")
+        # Local tools/ folder that gets copied (whole) to the VM.
+        self._tools_dir = _TOOLS_DIR
 
     # -- context-manager ---------------------------------------------------
 
@@ -403,20 +451,36 @@ class RemoteTools:
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        """Copy tools.py to the VM and start it via a single SSH connection."""
-        # 1. Copy the script to ~ on the VM.
-        self._scp()
+        """Copy the tools/ folder to the VM and start it over one SSH conn."""
+        # 0. Verify the VM's python3 meets the minimum version before any
+        #    remote Python work (dependency probing, pip install, server
+        #    launch).
+        self._check_python_version()
 
-        # 2. Open a single SSH connection that both runs tools.py on the
+        # 1. Copy the whole tools/ folder to ~/tools on the VM.
+        self._deploy()
+
+        # 2. Ensure the server's Python dependencies are installed on the
+        #    VM, idempotently: install only what is missing, reuse the rest.
+        self._ensure_dependencies()
+
+        # 3. Open a single SSH connection that both runs the server on the
         #    VM and forwards the port locally.
         self._open_tunnel()
 
-    def _scp(self) -> None:
-        """Copy the local ``tools.py`` to ``~/tools.py`` on the VM."""
-        dest = f"{self._vm.target}:~/tools.py"
+    def _deploy(self) -> None:
+        """Copy the local ``tools/`` folder to ``~/tools`` on the VM.
+
+        The whole folder is deployed (not just ``tools.py``) so the server can
+        import sibling modules.  The destination is removed first so a recursive
+        copy is idempotent across runs.
+        """
+        remote_dir = f"{self._vm.target}:~/tools"
+        # Start from a clean slate so the recursive copy always wins.
+        self._ssh("rm -rf ~/tools", check=False)
         cmd = self._vm.base_args(binary="scp", port_flag="-P")
-        cmd += [self._tools_path, dest]
-        print(f"[*] [tools] scp {os.path.basename(self._tools_path)} -> {dest}")
+        cmd += ["-r", self._tools_dir, remote_dir]
+        print(f"[*] [tools] scp -r {os.path.basename(self._tools_dir)}/ -> {remote_dir}")
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -425,15 +489,110 @@ class RemoteTools:
         if proc.returncode != 0:
             err = proc.stderr.decode(errors="replace")
             raise RuntimeError(f"[tools] scp failed:\n{err}")
-        print(f"[OK] [tools] copied to ~.")
+        print(f"[OK] [tools] copied {os.path.basename(self._tools_dir)}/ to ~/tools.")
+
+    # -- pre-flight checks -----------------------------------------------
+
+    def _check_python_version(self) -> None:
+        """
+        Verify the VM's ``python3`` is at least 3.12 before any remote Python work.
+
+        Runs ``python3 -c "import sys; print(...)"`` over SSH so the version
+        is reported by the interpreter itself (via ``sys.version_info``) rather
+        than by parsing the free-form ``--version`` string.  Raises
+        ``RuntimeError`` when the version is below 3.12.
+        """
+        # Asks the interpreter to print its major.minor components so we get
+        # a clean, implementation-independent value (works the same for
+        # CPython, PyPy, etc.) without fragile text parsing.
+        out = self._ssh(
+            f'{_PYTHON_BIN} -c "import sys; print(sys.version_info[0], sys.version_info[1])"'
+        )
+        # Output: "3 12"
+        try:
+            major, minor = (int(p) for p in out.split()[:2])
+        except ValueError:
+            raise RuntimeError(
+                f"[tools] could not parse VM python3 version from output: {out!r}"
+            )
+        version_str = f"{major}.{minor}"
+        if (major, minor) < _MIN_PYTHON_VERSION:
+            raise RuntimeError(
+                f"[tools] VM python3 is {version_str}; "
+                f"minimum required is {'.'.join(map(str, _MIN_PYTHON_VERSION))}"
+            )
+        print(
+            f"[OK] [tools] VM python3 is {version_str} "
+            f"(>= {'.'.join(map(str, _MIN_PYTHON_VERSION))})"
+        )
+
+    # -- dependency provisioning -------------------------------------------
+
+    def _ensure_dependencies(self) -> None:
+        """
+        Ensure the tools server's Python dependencies are installed *on the
+        VM*.
+
+        Idempotent: for each declared dependency it probes the VM with
+        ``python3 -c "import <module>"``.  When the import succeeds the
+        dependency is already present, so the existing installation is
+        *reused* and nothing is installed.  When it fails, the pip
+        *requirement* is installed with ``python3 -m pip install``.  Because
+        the install lands in the VM's Python environment (not the ``~/tools``
+        folder, which :meth:`_deploy` wipes on every run), it persists across
+        runs -- which is what makes the probe skip a later install.
+        """
+        for dep in self._tools_cfg.dependencies:
+            if self._dependency_present(dep):
+                print(
+                    f"[OK] [tools] dependency {dep.import_name!r} already "
+                    "installed on the VM; reusing."
+                )
+                continue
+            print(f"[*] [tools] installing {dep.requirement!r} on the VM ...")
+            self._install_dependency(dep)
+            print(f"[OK] [tools] installed {dep.requirement!r} on the VM.")
+
+    def _dependency_present(self, dep: ToolDependency) -> bool:
+        """
+        Return ``True`` when *dep*'s module is importable on the VM.
+
+        Probes the *same* interpreter the server runs under --
+        ``python3 -c "import <module>"`` -- so the result reflects what the
+        server will actually see when it starts.  A non-zero exit (e.g. a
+        ``ModuleNotFoundError``) means the module is not installed yet.
+        """
+        probe = f"{_PYTHON_BIN} -c 'import {dep.import_name}'"
+        proc = subprocess.run(
+            self._vm.base_args() + [self._vm.target, probe],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=30.0,
+        )
+        return proc.returncode == 0
+
+    def _install_dependency(self, dep: ToolDependency) -> None:
+        """
+        Install *dep* on the VM via ``python3 -m pip``.
+
+        Uses ``python3 -m pip`` rather than a bare ``pip`` so the package
+        lands in the *same* interpreter the presence probe and the server
+        both use.  Raises ``RuntimeError`` (via :meth:`_ssh`) when the
+        install fails.
+        """
+        # pip installs can be slow on a cold network; give the call room.
+        self._ssh(
+            f"{_PYTHON_BIN} -m pip install {dep.requirement}",
+            timeout=120.0,
+        )
 
     def _open_tunnel(self) -> None:
         """
         Start a single ``ssh -L`` connection that both forwards a local port
-        and runs ``python3 ~/tools.py`` as the remote command.  When this
-        SSH process is terminated, the remote ``tools.py`` dies with it.
+        and runs ``python3 ~/tools/tools.py`` as the remote command.  When this
+        SSH process is terminated, the remote server dies with it.
         """
-        remote_cmd = f"python3 ~/tools.py --port {self._remote_port}"
+        remote_cmd = f"{_PYTHON_BIN} ~/tools/tools.py --port {self._remote_port}"
         cmd = build_tunnel_args(
             self._vm, self._local_port, "127.0.0.1", self._remote_port,
             remote_cmd=remote_cmd,
@@ -512,6 +671,27 @@ class RemoteTools:
         if err:
             raise RuntimeError(f"[tools] {method}() error: {err}")
         return response.get("result")
+
+    def get_manifest(self) -> list[dict[str, Any]]:
+        """
+        Fetch the tool manifest the remote ``tools.py`` server advertises.
+
+        The manifest is a single ``tools`` command definition — in the
+        OpenAI/Ollama ``/api/chat`` "tools" shape
+        (``{"type": "function", "function": {...}}``) — that dispatches
+        into the server's tool registry.  The harness forwards it to the
+        model so the agent can request a tool call, then runs each
+        requested call back through :meth:`call`.
+
+        Raises ``RuntimeError`` when the server's reply is not a list.
+        """
+        result = self.call("manifest")
+        if not isinstance(result, list):
+            raise RuntimeError(
+                f"[tools] manifest() returned a {type(result).__name__}, "
+                "expected a list of tool definitions"
+            )
+        return result
 
     # -- teardown ----------------------------------------------------------
 

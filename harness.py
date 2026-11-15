@@ -36,6 +36,9 @@ Examples
 
     # with a system prompt
     python harness.py --system "You are a helpful assistant."
+
+    # override the model (local.env OLLAMA_MODEL)
+    python harness.py --model qwen2.5
 """
 
 from __future__ import annotations
@@ -52,6 +55,21 @@ from dataclasses import dataclass
 from typing import Any, Optional, TypeAlias, Union
 
 import requests
+
+
+# ---------------------------------------------------------------------------
+# Terminal colour helpers
+# ---------------------------------------------------------------------------
+
+_GREY = "\033[90m"   # bright black == grey
+_RESET = "\033[0m"
+
+
+def _grey(text: str) -> str:
+    """Wrap *text* in ANSI grey, but only when stdout is a real terminal."""
+    if not sys.stdout.isatty():
+        return text
+    return f"{_GREY}{text}{_RESET}"
 
 
 # requests types the ``json=`` argument as this recursive "JSON value" shape;
@@ -241,10 +259,33 @@ class SSHTunnel:
         )
 
 
+def model_supports_think(
+    base_url: str,
+    model: str,
+    *,
+    timeout: float = 30.0,
+) -> bool:
+    """
+    Query ``/api/show`` for *model* and return *True* when the model's
+    capabilities include ``"thinking"``.  This is a cheap metadata lookup —
+    it does not load the model into RAM.
+    """
+    try:
+        resp = requests.post(
+            f"{base_url}/api/show",
+            json={"model": model, "verbose": False},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        info = resp.json()
+    except (requests.RequestException, ValueError):
+        return False
+    return "thinking" in info.get("capabilities", [])
+
+
 # ---------------------------------------------------------------------------
 # Ollama /api/chat
 # ---------------------------------------------------------------------------
-
 def chat(
     base_url: str,
     model: str,
@@ -270,6 +311,13 @@ def chat(
 
     print(f"[*] Chat with model '{model}'. Press Ctrl+C to quit.")
 
+    # Probe the model to see whether it actually produces thinking / reasoning content.
+    supports_think = model_supports_think(base_url, model)
+    if supports_think:
+        print(_grey(f"[*] Model '{model}' supports think (reasoning enabled)."))
+    else:
+        print(_grey(f"[*] Model '{model}' does not support think."))
+
     while True:
         # Read a user turn.  input() raises KeyboardInterrupt on Ctrl+C and
         # EOFError on Ctrl+D / end-of-input; either ends the session.
@@ -290,9 +338,13 @@ def chat(
             "messages": messages,
             "stream": True,
         }
+        # Only ask the model to reason if it supports it.
+        if supports_think:
+            payload["think"] = True
 
         print(f"[*] POST /api/chat  model='{model}'  prompt='{prompt}'")
-        reply = []
+        reply: list[str] = []
+        reply_think: list[str] = []
         try:
             # stream=True + iter_lines(): Ollama emits NDJSON, one partial
             # message object per line, finished by a {"done": true} line.
@@ -311,13 +363,30 @@ def chat(
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    chunk = obj.get("message", {}).get("content", "")
+                    msg = obj.get("message", {})
+                    # Reasoning models stream their "thoughts" into
+                    # message.think; print them in grey so they don't get
+                    # confused with the actual answer.
+                    thought = msg.get("thinking")
+                    if thought:
+                        reply_think.append(thought)
+                        print(_grey(thought), end="", flush=True)
+                    chunk = msg.get("content", "")
                     if chunk:
+                        # Move to a new line when transitioning from thinking
+                        # to the actual response so they don't share a line.
+                        if reply_think and not reply:
+                            print()
+                            print()  # extra blank line after thinking section
                         reply.append(chunk)
                         print(chunk, end="", flush=True)  # print token-by-token
                     if obj.get("done"):
                         break
             print()  # newline so the next prompt starts on a fresh line
+            if reply_think:
+                joined = "".join(reply_think)
+                print()
+                print(_grey(f"[*] thoughts: {joined}"))
         except KeyboardInterrupt:
             print()                # interrupted mid-stream; stop and let the
             print("[*] Bye.")      # tunnel close in the context manager
@@ -343,6 +412,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # remain (the ones that are not part of local.env).
     p.add_argument("--key", default=None,
                    help="SSH key file (local.env SSH_KEY, optional)")
+    p.add_argument("--model", default=None,
+                   help="Model name to chat with (local.env OLLAMA_MODEL, default llama3)")
     p.add_argument("--system", default=None,
                    help="Optional system prompt")
     return p.parse_args(argv)
@@ -352,11 +423,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     # Connection and model settings come from local.env (loaded at module
-    # level); the only CLI override is --key.
+    # level); --key and --model override those when supplied.
     ssh_cfg = SSHConfig(
         key_filename=os.path.expanduser(args.key) if args.key else SSHConfig().key_filename,
     )
     ollama_cfg = OllamaConfig()
+    if args.model:
+        ollama_cfg.model = args.model
 
     with SSHTunnel(ssh_cfg, ollama_cfg) as tunnel:
         tunnel.wait_until_ready()

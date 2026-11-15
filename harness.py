@@ -318,14 +318,15 @@ def chat(
     else:
         print(_grey(f"[*] Model '{model}' does not support think."))
 
+    print()  # separator before the first prompt
     while True:
         # Read a user turn.  input() raises KeyboardInterrupt on Ctrl+C and
         # EOFError on Ctrl+D / end-of-input; either ends the session.
         try:
-            print()
             prompt = input(">>> ").strip()
         except (KeyboardInterrupt, EOFError):
             print()                 # move to a fresh line after the interrupt
+            print()
             print("[*] Bye.")
             return
 
@@ -342,9 +343,9 @@ def chat(
         if supports_think:
             payload["think"] = True
 
-        print(f"[*] POST /api/chat  model='{model}'  prompt='{prompt}'")
         reply: list[str] = []
         reply_think: list[str] = []
+        total_tokens: int = 0
         try:
             # stream=True + iter_lines(): Ollama emits NDJSON, one partial
             # message object per line, finished by a {"done": true} line.
@@ -381,14 +382,15 @@ def chat(
                         reply.append(chunk)
                         print(chunk, end="", flush=True)  # print token-by-token
                     if obj.get("done"):
+                        total_tokens = obj.get("prompt_eval_count", 0) + obj.get("eval_count", 0)
                         break
             print()  # newline so the next prompt starts on a fresh line
-            if reply_think:
-                joined = "".join(reply_think)
-                print()
-                print(_grey(f"[*] thoughts: {joined}"))
+            print()
+            print(f"[*] Tokens: {total_tokens}")
+            print()  # separator after tokens, before next prompt
         except KeyboardInterrupt:
             print()                # interrupted mid-stream; stop and let the
+            print()
             print("[*] Bye.")      # tunnel close in the context manager
             return
         except requests.RequestException as exc:
@@ -396,7 +398,16 @@ def chat(
             messages.pop()         # drop the user turn so it isn't replayed
             continue
 
-        messages.append({"role": "assistant", "content": "".join(reply)})
+        assistant_msg: dict[str, str] = {
+            "role": "assistant",
+            "content": "".join(reply),
+        }
+        # Feed the model's reasoning back into the conversation so it can
+        # build on its own chain-of-thought on the next turn.  Ollama emits
+        # reasoning in the "thinking" field, so send it back under the same key.
+        if reply_think:
+            assistant_msg["thinking"] = "".join(reply_think)
+        messages.append(assistant_msg)
 
 
 # ---------------------------------------------------------------------------

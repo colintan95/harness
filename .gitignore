@@ -5,3 +5,9 @@ local.env
 __pycache__/
 *.pyc
 *.pyo
+
+# mypy cache
+.mypy_cache/
+
+# Temp files
+tmp/

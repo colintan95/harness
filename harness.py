@@ -14,34 +14,57 @@ Configuration is read from ``local.env`` in the same directory.  Copy
 override ``local.env`` values.
 
 Connection and model settings are read from ``local.env``.  The remaining
-CLI flags (``--key``, ``--prompt``, ``--system``) override those settings or
-carry values that are not part of ``local.env``.
+CLI flags (``--key``, ``--system``) override those settings or carry values
+that are not part of ``local.env``.
+
+The program opens an interactive chat: a ``>>>`` prompt reads your input,
+forwards it to the model, prints the reply, and repeats until you press
+Ctrl+C.
 
 Usage
 -----
     python harness.py
+
+This opens an interactive session: type a message at the ``>>>`` prompt, the
+reply is printed, and you are prompted again.  Press Ctrl+C (or Ctrl+D) to
+quit.
 
 Examples
 --------
     # key auth via a specific key file
     python harness.py --key ~/.ssh/id_rsa
 
-    # custom prompt
-    python harness.py --prompt "What is 2+2?"
+    # with a system prompt
+    python harness.py --system "You are a helpful assistant."
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, TypeAlias, Union
 
 import requests
+
+
+# requests types the ``json=`` argument as this recursive "JSON value" shape;
+# mirror it so the chat payload type-checks without a ``cast``.
+JsonType: TypeAlias = Union[
+    None,
+    bool,
+    int,
+    float,
+    str,
+    Sequence["JsonType"],
+    Mapping[str, "JsonType"],
+]
 
 
 # ---------------------------------------------------------------------------
@@ -118,16 +141,16 @@ class SSHTunnel:
 
     Usage::
 
-        with SSHTunnel(cfg, ocfg) as tunnel:
+        with SSHTunnel(ssh_cfg, ollama_cfg) as tunnel:
             tunnel.wait_until_ready()
-            chat(tunnel, "llama3", "hello")
+            chat(tunnel.base_url(), ollama_cfg.model)
     """
 
     def __init__(self, ssh_cfg: SSHConfig, ollama_cfg: OllamaConfig):
         self.ssh_cfg = ssh_cfg
         self.ollama_cfg = ollama_cfg
         self.local_port = ollama_cfg.local_port
-        self._proc: Optional[subprocess.Popen] = None
+        self._proc: Optional[subprocess.Popen[Any]] = None
 
     # -- context-manager ---------------------------------------------------
 
@@ -135,7 +158,7 @@ class SSHTunnel:
         self.connect()
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     # -- lifecycle ---------------------------------------------------------
@@ -225,37 +248,86 @@ class SSHTunnel:
 def chat(
     base_url: str,
     model: str,
-    prompt: str = "hello",
     *,
     timeout: float = 300.0,
     system: Optional[str] = None,
-) -> dict:
+) -> None:
     """
-    POST /api/chat – load *model* into memory and send a single user turn.
+    Interactive REPL over /api/chat.
 
-    Ollama loads the model on the first request if it is not already in RAM,
-    so this doubles as a "start model" call.
+    Prints a ``>>>`` prompt, reads a user turn from stdin, POSTs the growing
+    conversation to the remote Ollama server, streams the model's reply
+    token-by-token, and repeats.  Runs until the user interrupts with Ctrl+C
+    (or Ctrl+D / EOF).
+
+    Ollama loads the model into memory on the first request if it is not
+    already in RAM, so the first turn also doubles as a "start model" call.
+    Conversation context is kept between turns.
     """
-    messages = []
+    messages: list[dict[str, str]] = []
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
 
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-    }
+    print(f"[*] Chat with model '{model}'. Press Ctrl+C to quit.")
 
-    print(f"[*] POST /api/chat  model='{model}'  prompt='{prompt}'")
-    r = requests.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
+    while True:
+        # Read a user turn.  input() raises KeyboardInterrupt on Ctrl+C and
+        # EOFError on Ctrl+D / end-of-input; either ends the session.
+        try:
+            print()
+            prompt = input(">>> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()                 # move to a fresh line after the interrupt
+            print("[*] Bye.")
+            return
 
-    reply = data.get("message", {}).get("content", "")
-    print(f"[OK] Model '{model}' is running.")
-    print(f"     Response: {reply[:200]}")
-    return data
+        if not prompt:
+            continue               # empty line: just prompt again
+
+        messages.append({"role": "user", "content": prompt})
+        payload: dict[str, JsonType] = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+        }
+
+        print(f"[*] POST /api/chat  model='{model}'  prompt='{prompt}'")
+        reply = []
+        try:
+            # stream=True + iter_lines(): Ollama emits NDJSON, one partial
+            # message object per line, finished by a {"done": true} line.
+            print()  # blank line before the response
+            with requests.post(
+                f"{base_url}/api/chat",
+                json=payload,
+                stream=True,
+                timeout=timeout,
+            ) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = obj.get("message", {}).get("content", "")
+                    if chunk:
+                        reply.append(chunk)
+                        print(chunk, end="", flush=True)  # print token-by-token
+                    if obj.get("done"):
+                        break
+            print()  # newline so the next prompt starts on a fresh line
+        except KeyboardInterrupt:
+            print()                # interrupted mid-stream; stop and let the
+            print("[*] Bye.")      # tunnel close in the context manager
+            return
+        except requests.RequestException as exc:
+            print(f"[!] request failed: {exc}")
+            messages.pop()         # drop the user turn so it isn't replayed
+            continue
+
+        messages.append({"role": "assistant", "content": "".join(reply)})
 
 
 # ---------------------------------------------------------------------------
@@ -271,8 +343,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # remain (the ones that are not part of local.env).
     p.add_argument("--key", default=None,
                    help="SSH key file (local.env SSH_KEY, optional)")
-    p.add_argument("--prompt", default="hello",
-                   help="User prompt sent to /api/chat (default 'hello')")
     p.add_argument("--system", default=None,
                    help="Optional system prompt")
     return p.parse_args(argv)
@@ -290,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
 
     with SSHTunnel(ssh_cfg, ollama_cfg) as tunnel:
         tunnel.wait_until_ready()
-        chat(tunnel.base_url(), ollama_cfg.model, prompt=args.prompt, system=args.system)
+        chat(tunnel.base_url(), ollama_cfg.model, system=args.system)
     return 0
 
 

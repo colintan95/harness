@@ -208,13 +208,25 @@ def _spawn_ssh(
 ) -> subprocess.Popen[Any]:
     """
     Start *cmd* as a detached ``ssh`` process and fail fast if it dies on
-    startup.  ``start_new_session=True`` detaches ssh into its own session /
-    process group so a Ctrl+C (SIGINT to the terminal's foreground group)
-    does not reach the tunnel; that keeps it alive long enough for a graceful
-    shutdown to run.
+    startup.
+
+    Two detachments keep the spawned process tree independent of the
+    harness's terminal:
+
+    * ``start_new_session=True`` puts ssh in its own session / process group,
+      so a Ctrl+C (SIGINT to the terminal's foreground group) does not reach
+      the tunnel; that keeps it alive long enough for a graceful shutdown to
+      run.
+    * ``stdin=DEVNULL`` severs the process's stdin from the host, so neither
+      ssh nor anything it runs remotely (e.g. the ``tools.py`` server and the
+      commands that server spawns) can block waiting on a terminal/pipe the
+      harness never feeds.
+
+    ``stdout`` is dropped and ``stderr`` is captured for the fail-fast check.
     """
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -391,7 +403,7 @@ class RemoteTools:
     Usage::
 
         with RemoteTools(vm_cfg, tools_cfg) as tools:
-            greeting = tools.call("hello")                # -> "Hello, World!"
+            result = tools.call("web_search", "cats")    # -> [ ... ]
     """
 
     def __init__(
@@ -615,7 +627,7 @@ class RemoteTools:
     # -- RPC call ----------------------------------------------------------
 
     def _send_request(
-        self, request: dict[str, Any], *, timeout: float = 10.0,
+        self, request: dict[str, Any], *, timeout: float = 60.0,
     ) -> str:
         """
         Open a fresh connection to the local forwarded port, send one
@@ -625,7 +637,10 @@ class RemoteTools:
         replying.
 
         *timeout* bounds both the connect and the (blocking) read so a
-        hung server cannot block the caller forever.
+        hung server cannot block the caller forever.  The default is a
+        generous safety bound (larger than the slowest model-facing tool's
+        own budget, e.g. ``run_command``'s 30s) so a legitimate long
+        command is not preempted client-side and surfaced as "timed out".
         """
         payload = json.dumps(request).encode("utf-8") + b"\n"
         with socket.create_connection(
@@ -650,7 +665,7 @@ class RemoteTools:
         The wire protocol is one newline-delimited JSON object per
         connection::
 
-            request  ->  {"method": "hello", "args": [...], "kwargs": {}}
+            request  ->  {"method": "web_search", "args": [...], "kwargs": {}}
             response ->  {"result": <value>, "error": null}
 
         Raises ``RuntimeError`` when the server returns an error, the

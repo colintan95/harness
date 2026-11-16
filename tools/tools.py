@@ -27,7 +27,7 @@ The server keeps two kinds of request deliberately separate:
   lifecycle messages.  The harness fetches the tool manifest at start-up
   and asks the server to stop at exit.  They live in :data:`CONTROL` and
   are *never* part of the manifest, so the model never sees or calls them.
-* **Tool commands** (e.g. ``web_search``, ``hello``) are the model-facing
+* **Tool commands** (e.g. ``web_search``) are the model-facing
   entries.  Each registered tool in :data:`TOOLS` gets its own entry in
   the manifest with its own name, description, and parameter schema, so
   the model calls each tool by name directly.
@@ -54,7 +54,10 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
+import signal
 import socket
+import subprocess
 from collections.abc import Callable
 from typing import Any
 
@@ -95,11 +98,6 @@ MANIFEST_METHOD = "manifest"
 # Tools – the model-facing callables, each advertised in the manifest by name
 # ---------------------------------------------------------------------------
 
-def hello() -> str:
-    """Return a simple greeting.  This is the first demo call."""
-    return "Hello, World!"
-
-
 def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     """
     Search the web via DuckDuckGo and return up to *max_results* results.
@@ -117,12 +115,86 @@ def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     return list(DDGS().text(query, max_results=max_results))
 
 
+def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
+    """
+    Execute a *command* string and capture its output.
+
+    Runs the command directly via ``subprocess`` on the VM (using the
+    system shell so the string is parsed like a normal command line).
+    Returns a dict with the process ``exit_code``, captured ``stdout`` and
+    ``stderr`` text, and an ``error`` field that is populated (non-empty)
+    when the command fails to start or times out instead of running to
+    completion.
+    """
+    # Coerce to float: LLMs sometimes pass numeric args as strings.
+    timeout = float(timeout)
+
+    # Two independent hardenings, both kept so the command is correct no
+    # matter how the server itself was launched:
+    #
+    #   * stdin=subprocess.DEVNULL detaches the child's stdin so it can't
+    #     block waiting on a terminal/pipe.  The server's own stdin is
+    #     already /dev/null (the harness starts it that way via
+    #     _spawn_ssh), so this is defense-in-depth: it also covers running
+    #     tools.py by some other path (e.g. locally for testing).
+    #
+    #   * start_new_session=True makes the child its own process-group
+    #     leader so that, on timeout, we can kill the whole tree a shell
+    #     may have spawned (os.killpg below) instead of leaking orphan
+    #     processes.
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "error": str(exc),
+        }
+
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The command outlived its budget.  Kill the whole process group so
+        # any children the shell spawned are reaped too, then drain the
+        # pipes to capture whatever it had written before dying.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass  # the process (and its group) already exited
+        try:
+            out, err = proc.communicate()
+        except Exception:
+            out, err = "", ""
+        return {
+            "exit_code": None,
+            "stdout": out or "",
+            "stderr": err or "",
+            "error": f"command timed out after {timeout}s",
+        }
+
+    return {
+        "exit_code": proc.returncode,
+        "stdout": out or "",
+        "stderr": err or "",
+        "error": None,
+    }
+
+
 # The model-facing tools.  Each entry gets its own manifest definition so
 # the model can call it directly by name.  Control commands
 # (``manifest``, ``shutdown``) do not live here — see :data:`CONTROL`.
 TOOLS: dict[str, Callable[..., Any]] = {
-    "hello": hello,
     "web_search": web_search,
+    "run_command": run_command,
 }
 
 
@@ -250,8 +322,8 @@ def manifest() -> list[dict[str, Any]]:
     """
     Build the tool manifest the harness advertises to the model.
 
-    Returns one entry per tool in :data:`TOOLS` (e.g. ``hello``,
-    ``web_search``).  Each entry carries the tool's name, description,
+    Returns one entry per tool in :data:`TOOLS` (e.g. ``web_search``).  Each
+    entry carries the tool's name, description,
     and parameter schema so the model can call it directly.  The control
     commands (``manifest``, ``shutdown``) are deliberately absent — they
     are harness lifecycle messages, not model-facing tools, so they never
@@ -382,8 +454,8 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
     Route one request to a handler and return a ``{"result", "error"}`` dict.
 
     Control commands (``manifest``, ``shutdown``) dispatch through
-    :data:`CONTROL`; each model-facing tool (e.g. ``web_search``,
-    ``hello``) dispatches directly into :data:`TOOLS` by its own name;
+    :data:`CONTROL`; each model-facing tool (e.g. ``web_search``) dispatches
+    directly into :data:`TOOLS` by its own name;
     anything else is an unknown method.
     """
     method: str = request.get("method", "")

@@ -11,12 +11,10 @@ locally.  For the VM it runs ``tools.py`` as a remote RPC server over the
 same SSH connection style; VM settings come from ``VM_*`` keys in
 ``local.env``.
 
-It also deploys the ``tools/`` folder to the VM, runs it as a background RPC
-server for the lifetime of the harness, and makes an initial demo call
-(``hello()``) that returns ``"Hello, World!"``.  When the harness
-exits (e.g. Ctrl+C) it sends a ``shutdown`` message to ``tools.py`` and
-waits for the tool to confirm it is stopping before closing the SSH
-session.
+It also deploys the ``tools/`` folder to the VM and runs it as a background
+RPC server for the lifetime of the harness.  When the harness exits
+(e.g. Ctrl+C) it sends a ``shutdown`` message to ``tools.py`` and waits for
+the tool to confirm it is stopping before closing the SSH session.
 
 The server's tool manifest -- one entry per tool in Ollama's
 ``/api/chat`` "tools" shape, each carrying its own name, description,
@@ -461,12 +459,6 @@ def main(argv: list[str] | None = None) -> int:
         # confirmation) when the with-block ends (normal exit, exception,
         # or KeyboardInterrupt from Ctrl+C in the chat).
         with RemoteTools(vm_ssh_cfg, tools_cfg) as tools:
-            # --- demo call: show that the RPC round-trip works ---
-            # Each tool is its own model-facing command; the demo drives
-            # the `hello` tool directly.
-            result = tools.call("hello")
-            print(f"[*] hello() -> {result!r}")
-
             # --- surface the tool manifest to the model ---
             # Ask the remote server for its manifest: one entry per tool
             # (in Ollama's /api/chat "tools" shape), each with its own

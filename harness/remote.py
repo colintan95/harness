@@ -28,6 +28,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -397,6 +398,30 @@ _MIN_PYTHON_VERSION: tuple[int, int] = (3, 12)
 # The Python interpreter on the VM; resolved via PATH.
 _PYTHON_BIN = "python3"
 
+# Control command name the client sends to ask the server to interrupt the
+# in-flight tool.  Must match CANCEL_METHOD in tools.py.
+CANCEL_METHOD = "cancel"
+
+# Poll cadence (seconds) for the client's read loop: how often a blocked
+# request re-checks the cancel flag between reads.
+_READ_INTERVAL = 0.2
+
+
+class RemoteToolInterrupt(Exception):
+    """
+    The remote server cancelled an in-flight tool (a user interrupt).
+
+    Raised by :meth:`RemoteTools.call` when the server's reply carries a
+    ``cancelled`` flag; carries whatever partial result the server produced.
+    The harness catches it to record an interruption in the transcript
+    instead of turning it into a generic tool error.
+    """
+
+    def __init__(self, payload: Any) -> None:
+        super().__init__("tool call interrupted by the user")
+        self.payload = payload
+
+
 class RemoteTools:
     """
     Deploy the ``tools/`` folder to the VM and run its ``tools.py`` server as a
@@ -646,7 +671,11 @@ class RemoteTools:
     # -- RPC call ----------------------------------------------------------
 
     def _send_request(
-        self, request: dict[str, Any], *, timeout: float = 60.0,
+        self,
+        request: dict[str, Any],
+        *,
+        timeout: float = 60.0,
+        cancel: threading.Event | None = None,
     ) -> str:
         """
         Open a fresh connection to the local forwarded port, send one
@@ -655,28 +684,75 @@ class RemoteTools:
         empty string when the server closes the connection without
         replying.
 
-        *timeout* bounds both the connect and the (blocking) read so a
-        hung server cannot block the caller forever.  The default is a
-        generous safety bound (larger than the slowest model-facing tool's
-        own budget, e.g. ``run_command``'s 30s) so a legitimate long
-        command is not preempted client-side and surfaced as "timed out".
+        *timeout* bounds both the connect and the read so a hung server
+        cannot block the caller forever.  The default is a generous safety
+        bound (larger than the slowest model-facing tool's own budget, e.g.
+        ``run_command``'s 30s) so a legitimate long command is not preempted
+        client-side and surfaced as "timed out".
+
+        When *cancel* is provided, the read loop polls it between reads: on a
+        set event it fires a cancel control message (:meth:`_send_cancel`) so
+        the server stops the in-flight tool, then keeps reading for the
+        cancelled envelope the server sends back on this same connection.
         """
         payload = json.dumps(request).encode("utf-8") + b"\n"
         with socket.create_connection(
             ("127.0.0.1", self._local_port), timeout=timeout,
         ) as conn:
             conn.sendall(payload)
-            conn.settimeout(timeout)
-            # Read the response (newline-delimited JSON).
+            deadline = time.monotonic() + timeout
+            conn.settimeout(_READ_INTERVAL)
             buf = bytearray()
+            cancelled = False
             while b"\n" not in buf:
-                chunk = conn.recv(4096)
+                # Poll for a user interrupt between reads.  A single thread
+                # can't write to a socket it's blocked reading, so the cancel
+                # goes out over a separate connection and the cancelled result
+                # comes back on this one.
+                if cancel is not None and cancel.is_set() and not cancelled:
+                    self._send_cancel()
+                    cancelled = True
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"[tools] no response from "
+                            f"{request.get('method')!r} within {timeout}s"
+                        )
+                    continue
                 if not chunk:
                     break
                 buf.extend(chunk)
             return buf.decode("utf-8", errors="replace").strip()
 
-    def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+    def _send_cancel(self) -> None:
+        """
+        Fire a cancel control request over a fresh connection.
+
+        The in-flight request's connection is still blocking its read, so the
+        cancel can't go there (a single thread can't write to a socket it's
+        reading).  A throwaway connection lets the cancel reach the server
+        concurrently; the server sets its cancel flag and the cancelled result
+        is delivered on the *request* connection.  This reply is ignored.
+        """
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", self._local_port), timeout=5.0,
+            ) as conn:
+                conn.sendall(
+                    json.dumps({"method": CANCEL_METHOD}).encode("utf-8") + b"\n"
+                )
+        except OSError:
+            pass
+
+    def call(
+        self,
+        method: str,
+        *args: Any,
+        cancel: threading.Event | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """
         Send a JSON-RPC request to the remote ``tools.py`` server and
         return the ``result`` field.
@@ -687,8 +763,15 @@ class RemoteTools:
             request  ->  {"method": "web_search", "args": [...], "kwargs": {}}
             response ->  {"result": <value>, "error": null}
 
-        Raises ``RuntimeError`` when the server returns an error, the
-        connection fails, or the server closes without replying.
+        When *cancel* (a threading.Event the harness sets on a user Ctrl+C
+        during the call) is provided, the in-flight request can be
+        interrupted: the read loop sends a cancel control message to the
+        server and the call raises :class:`RemoteToolInterrupt` when the
+        server reports the tool was cancelled.
+
+        Raises ``RemoteToolInterrupt`` when the user cancels the call;
+        ``RuntimeError`` when the server returns an error, the connection
+        fails, or the server closes without replying.
         """
         request: dict[str, Any] = {"method": method}
         if args:
@@ -696,11 +779,16 @@ class RemoteTools:
         if kwargs:
             request["kwargs"] = kwargs
 
-        raw = self._send_request(request)
+        raw = self._send_request(request, cancel=cancel)
         if not raw:
             raise RuntimeError(f"[tools] empty response from {method!r}")
 
         response = json.loads(raw)
+        # A "cancelled" envelope means the user interrupted this tool and the
+        # server stopped it; surface that as a dedicated exception so the
+        # harness records an interruption instead of a generic error.
+        if response.get("cancelled"):
+            raise RemoteToolInterrupt(response.get("result"))
         err = response.get("error")
         if err:
             raise RuntimeError(f"[tools] {method}() error: {err}")

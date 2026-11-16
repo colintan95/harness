@@ -58,6 +58,8 @@ import os
 import signal
 import socket
 import subprocess
+import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -93,6 +95,46 @@ SHUTDOWN_METHOD = "shutdown"
 # harness lifecycle message, never advertised to the model.
 MANIFEST_METHOD = "manifest"
 
+# Control command: ask the server to interrupt the in-flight tool (a user
+# Ctrl+C during a tool call).  A harness lifecycle message, never advertised to
+# the model.
+CANCEL_METHOD = "cancel"
+
+# Poll cadence (seconds) shared by the cancellable tool runner, run_command's
+# communicate loop, and the accept loop: how often a blocked call re-checks the
+# CANCEL flag.
+_POLL = 0.2
+
+# On cancel, how long (seconds) the runner waits for a *cooperative* tool
+# (run_command) to finish cleaning up and report a payload such as partial
+# output before abandoning it.  A non-cooperative blocking call (web_search)
+# simply outlives the grace and is abandoned.
+_CANCEL_GRACE = 0.5
+
+
+class ToolInterrupted(Exception):
+    """
+    Raised by a cooperative tool (run_command) when a user interrupt cancels
+    it, after it has cleaned up its own resources (killing its child process
+    group).  Carries whatever partial result it managed to produce.  The
+    cancellable runner converts it -- and abandons non-cooperative blocking
+    calls -- into a structured ``cancelled`` response envelope.
+    """
+
+    def __init__(self, payload: Any) -> None:
+        super().__init__("tool call interrupted by the user")
+        self.payload = payload
+
+
+# Set by the ``cancel`` control command; watched by the cancellable runner and
+# by cooperative tools (run_command).  Cleared at the start of each tool run so
+# a stale cancel can't bleed into the next call.
+CANCEL = threading.Event()
+
+# Set by the ``shutdown`` control command; watched by the serve() accept loop so
+# a threaded server stops accepting once a graceful stop is requested.
+_SHUTDOWN = threading.Event()
+
 
 # ---------------------------------------------------------------------------
 # Tools – the model-facing callables, each advertised in the manifest by name
@@ -115,6 +157,26 @@ def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     return list(DDGS().text(query, max_results=max_results))
 
 
+def _kill_and_drain(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    """
+    Kill a process's group and drain its output.
+
+    Sends SIGKILL to the whole process group (the child was started in its own
+    group via ``start_new_session=True``) so any children the shell spawned are
+    reaped too, then drains the pipes to capture whatever was written.  Returns
+    ``(stdout, stderr)``.  Used on both the timeout and the interrupt paths.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        pass  # the process (and its group) already exited
+    try:
+        out, err = proc.communicate()
+    except Exception:
+        out, err = "", ""
+    return out or "", err or ""
+
+
 def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
     """
     Execute a *command* string and capture its output.
@@ -123,8 +185,8 @@ def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
     system shell so the string is parsed like a normal command line).
     Returns a dict with the process ``exit_code``, captured ``stdout`` and
     ``stderr`` text, and an ``error`` field that is populated (non-empty)
-    when the command fails to start or times out instead of running to
-    completion.
+    when the command fails to start, times out, or is interrupted by the user
+    instead of running to completion.
     """
     # Coerce to float: LLMs sometimes pass numeric args as strings.
     timeout = float(timeout)
@@ -139,9 +201,9 @@ def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
     #     tools.py by some other path (e.g. locally for testing).
     #
     #   * start_new_session=True makes the child its own process-group
-    #     leader so that, on timeout, we can kill the whole tree a shell
-    #     may have spawned (os.killpg below) instead of leaking orphan
-    #     processes.
+    #     leader so that, on timeout *or* on a user interrupt, we can kill the
+    #     whole tree a shell may have spawned (os.killpg in _kill_and_drain)
+    #     instead of leaking orphan processes.
     try:
         proc = subprocess.Popen(
             command,
@@ -160,26 +222,40 @@ def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
             "error": str(exc),
         }
 
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # The command outlived its budget.  Kill the whole process group so
-        # any children the shell spawned are reaped too, then drain the
-        # pipes to capture whatever it had written before dying.
+    # Poll communicate() with a short timeout so a user interrupt (CANCEL) can
+    # kill the child *mid-run* instead of waiting for the full budget; the same
+    # poll also bounds the original hard timeout.  On cancel we raise
+    # ToolInterrupted carrying the partial output, which the cancellable runner
+    # turns into a "cancelled" envelope.
+    deadline = time.monotonic() + timeout
+    out, err = "", ""
+    while True:
+        if CANCEL.is_set():
+            out, err = _kill_and_drain(proc)
+            raise ToolInterrupted(
+                {
+                    "exit_code": None,
+                    "stdout": out,
+                    "stderr": err,
+                    "error": "interrupted by the user",
+                }
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # The command outlived its budget: kill the whole process group so
+            # any children the shell spawned are reaped too, then drain.
+            out, err = _kill_and_drain(proc)
+            return {
+                "exit_code": None,
+                "stdout": out,
+                "stderr": err,
+                "error": f"command timed out after {timeout}s",
+            }
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except OSError:
-            pass  # the process (and its group) already exited
-        try:
-            out, err = proc.communicate()
-        except Exception:
-            out, err = "", ""
-        return {
-            "exit_code": None,
-            "stdout": out or "",
-            "stderr": err or "",
-            "error": f"command timed out after {timeout}s",
-        }
+            out, err = proc.communicate(timeout=min(_POLL, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
 
     return {
         "exit_code": proc.returncode,
@@ -211,10 +287,25 @@ def shutdown() -> dict[str, Any]:
     itself down (as opposed to the SSH session killing it with SIGTERM).
     """
     _cleanup()
+    # Signal the threaded accept loop to stop so the server exits cleanly.
+    _SHUTDOWN.set()
     return {
         "status": "shutting_down",
         "message": "tools.py is shutting down",
     }
+
+
+def cancel() -> dict[str, Any]:
+    """
+    Control message: ask the server to interrupt the in-flight tool.
+
+    Sets the module-level CANCEL flag that the cancellable runner watches and
+    that cooperative tools (run_command) observe.  The cancelled result is
+    returned on the *request* connection where the tool was running; this
+    control reply is fire-and-forget (the harness ignores it).
+    """
+    CANCEL.set()
+    return {"status": "cancelled"}
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +430,7 @@ def manifest() -> list[dict[str, Any]]:
 CONTROL: dict[str, Callable[..., Any]] = {
     MANIFEST_METHOD: manifest,
     SHUTDOWN_METHOD: shutdown,
+    CANCEL_METHOD: cancel,
 }
 
 
@@ -362,25 +454,32 @@ def _cleanup() -> None:
 
 def serve(host: str, port: int) -> None:
     """
-    Bind a TCP socket and handle connections sequentially.
+    Bind a TCP socket and handle one connection per thread.
 
     Each connection carries one newline-delimited JSON request; the
-    response is a single JSON object.  The loop runs until a
-    ``shutdown`` control message is received (a graceful stop) or the
-    process is terminated.
+    response is a single JSON object.  Handling each connection in its own
+    daemon thread lets a control message such as ``cancel`` be serviced while
+    a tool call is running on another connection.  The loop runs until the
+    ``_SHUTDOWN`` flag is set (a ``shutdown`` control message) or the process
+    is terminated.
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(8)
+    # A short accept timeout so the loop can re-check _SHUTDOWN between
+    # connections instead of blocking forever on accept().
+    srv.settimeout(_POLL)
     print(f"[tools] listening on {host}:{port}", flush=True)
 
-    while True:
-        conn, _ = srv.accept()
-        stop = _handle_one(conn)
-        if stop:
-            print("[tools] shutdown confirmed; closing server", flush=True)
-            break
+    while not _SHUTDOWN.is_set():
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        # Each connection is handled in its own daemon thread so a control
+        # message (cancel/shutdown) can be serviced while a tool runs.
+        threading.Thread(target=_handle_one, args=(conn,), daemon=True).start()
     srv.close()
     print("[tools] server stopped", flush=True)
 
@@ -389,14 +488,15 @@ def serve(host: str, port: int) -> None:
 # Per-connection handling
 # ---------------------------------------------------------------------------
 
-def _handle_one(conn: socket.socket) -> bool:
+def _handle_one(conn: socket.socket) -> None:
     """
     Read one JSON request, dispatch, send the JSON response, close.
 
-    Returns ``True`` when the request was the ``shutdown`` control
-    message, so the serve loop knows to stop after this connection.
+    Runs in its own thread (serve() spawns one per connection) so a control
+    message such as ``cancel`` can be serviced while a tool call is running on
+    another connection.  A ``shutdown`` request stops the server via the
+    _SHUTDOWN event in serve(), not via any return value here.
     """
-    stop = False
     try:
         # ---- read request (newline-delimited JSON) ----
         buf = bytearray()
@@ -407,9 +507,8 @@ def _handle_one(conn: socket.socket) -> bool:
             buf.extend(chunk)
         raw = buf.decode("utf-8", errors="replace").strip()
         if not raw:
-            return False
+            return
         request = json.loads(raw)
-        method = request.get("method", "")
 
         # ---- dispatch ----
         result_obj = _dispatch(request)
@@ -417,9 +516,6 @@ def _handle_one(conn: socket.socket) -> bool:
         # ---- write response ----
         payload = json.dumps(result_obj).encode("utf-8") + b"\n"
         conn.sendall(payload)
-
-        # A shutdown control message asks the server to stop next.
-        stop = method == SHUTDOWN_METHOD
     except Exception as exc:
         # Always try to send an error response so the caller doesn't hang.
         err = json.dumps({"result": None, "error": str(exc)}).encode() + b"\n"
@@ -429,7 +525,6 @@ def _handle_one(conn: socket.socket) -> bool:
             pass
     finally:
         conn.close()
-    return stop
 
 
 # ---------------------------------------------------------------------------
@@ -441,12 +536,72 @@ def _invoke(
     args: list[Any],
     kwargs: dict[str, Any],
 ) -> dict[str, Any]:
-    """Call *fn* with *args*/*kwargs*, returning the result/error envelope."""
+    """
+    Call *fn* with *args*/*kwargs*, returning the result/error envelope.
+
+    Used for control commands (manifest/shutdown/cancel), which run inline and
+    are not cancellable.
+    """
     try:
         result = fn(*args, **kwargs)
         return {"result": result, "error": None}
     except Exception as exc:
         return {"result": None, "error": str(exc)}
+
+
+def _run_tool(
+    fn: Callable[..., Any],
+    args: list[Any],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Invoke a model-facing tool with cancellation.
+
+    The tool runs in a daemon worker thread while this thread polls the
+    module-level CANCEL flag.  On cancel we stop waiting and return a
+    cancelled envelope; the worker is abandoned (a non-cooperative blocking
+    call -- e.g. web_search -- can't be preempted, so it finishes or dies in
+    the background).  A cooperative tool that raises ToolInterrupted
+    (run_command kills its child group and raises it) contributes its payload
+    to the envelope.
+
+    The envelope always carries a ``cancelled`` key (unlike control replies) so
+    the client can tell an interrupted call from a normal result or error.
+    """
+    # A fresh tool run starts with no pending cancel.
+    CANCEL.clear()
+    box: list[Any] = []
+
+    def worker() -> None:
+        try:
+            box.append(fn(*args, **kwargs))
+        except BaseException as exc:
+            # Capture any outcome -- including ToolInterrupted -- for the
+            # polling loop below.
+            box.append(exc)
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    while t.is_alive():
+        if CANCEL.is_set():
+            # Give a cooperative tool a brief grace to clean up its own
+            # resources (run_command kills its child group) and report a
+            # payload; a non-cooperative blocking call is simply abandoned.
+            t.join(timeout=_CANCEL_GRACE)
+            if not t.is_alive() and box and isinstance(box[-1], ToolInterrupted):
+                return {
+                    "result": box[-1].payload,
+                    "error": None,
+                    "cancelled": True,
+                }
+            return {"result": None, "error": None, "cancelled": True}
+        t.join(timeout=_POLL)
+    outcome = box[0]
+    if isinstance(outcome, ToolInterrupted):
+        return {"result": outcome.payload, "error": None, "cancelled": True}
+    if isinstance(outcome, BaseException):
+        return {"result": None, "error": str(outcome), "cancelled": False}
+    return {"result": outcome, "error": None, "cancelled": False}
 
 
 def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
@@ -467,10 +622,11 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
     if control is not None:
         return _invoke(control, args, kwargs)
 
-    # Model-facing tools: route directly to the tool by name.
+    # Model-facing tools: route through the cancellable runner so a user
+    # interrupt can stop the in-flight call.
     tool = TOOLS.get(method)
     if tool is not None:
-        return _invoke(tool, args, kwargs)
+        return _run_tool(tool, args, kwargs)
 
     return {"result": None, "error": f"unknown method: {method!r}"}
 

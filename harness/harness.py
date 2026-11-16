@@ -49,7 +49,7 @@ This opens an interactive session: type a message at the ``>>>`` prompt, the
 reply is printed, and you are prompted again.  Press Ctrl+C (or Ctrl+D) at the
 prompt to quit; press Ctrl+C while the model is streaming to keep the partial
 response and thought (plus an interruption note) and return to the prompt, or
-while a tool call is running to finish that call and return to the prompt.
+while a tool call is running to cancel that call and return to the prompt.
 
 Examples
 --------
@@ -71,6 +71,7 @@ import json
 import os
 import signal
 import sys
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Optional, TypeAlias, Union
 
@@ -82,6 +83,7 @@ import requests
 from remote import (
     OllamaConfig,
     OllamaTunnel,
+    RemoteToolInterrupt,
     RemoteTools,
     SSHConfig,
     ToolsConfig,
@@ -294,8 +296,9 @@ def _stream_turn(
 
 
 def _invoke_tool(
-    call_tool: Callable[[str, dict[str, Any]], Any],
+    call_tool: Callable[..., Any],
     tool_call: dict[str, Any],
+    cancel: threading.Event,
 ) -> str:
     """
     Run one model-requested tool call and return its result as a string.
@@ -305,6 +308,12 @@ def _invoke_tool(
     for the ``role: "tool"`` message; a tool error is reported back to the
     model as a JSON error object so it can recover instead of the session
     crashing.
+
+    *cancel* is a threading.Event the SIGINT handler sets while this call is
+    running; it is forwarded to *call_tool* so the remote server can interrupt
+    the in-flight tool.  A :class:`RemoteToolInterrupt` (the user cancelled the
+    call) is *not* swallowed here -- it propagates so the chat loop can record
+    an interruption instead of a generic error.
     """
     function = tool_call.get("function", {})
     name = function.get("name", "")
@@ -312,7 +321,11 @@ def _invoke_tool(
     if not isinstance(arguments, dict):
         arguments = {}
     try:
-        result = call_tool(name, arguments)
+        result = call_tool(name, arguments, cancel=cancel)
+    except RemoteToolInterrupt:
+        # The user cancelled this call; let the chat loop record the
+        # interruption rather than turning it into a generic tool error.
+        raise
     except Exception as exc:
         return json.dumps({"error": str(exc)})
     if isinstance(result, str):
@@ -338,7 +351,7 @@ def chat(
     timeout: float = 300.0,
     system: Optional[str] = None,
     tools: list[dict[str, Any]] | None = None,
-    call_tool: Callable[[str, dict[str, Any]], Any] | None = None,
+    call_tool: Callable[..., Any] | None = None,
 ) -> None:
     """
     Interactive REPL over /api/chat.
@@ -352,8 +365,9 @@ def chat(
     quitting: during a model stream the in-flight request is aborted but the
     user's prompt and the partial response/thought already generated are kept,
     together with a note that the turn was interrupted by the user; during a
-    tool call the current call is allowed to finish, its result is appended to
-    the conversation, and *then* the loop stops and returns to the prompt.
+    tool call the in-flight call is cancelled (the server is asked to stop
+    it and the tool's result is replaced by an interruption note), and *then*
+    the loop stops and returns to the prompt.
 
     When *tools* (the manifest the remote server advertised) is given, it is
     forwarded to the model under ``tools``; when the model requests a tool
@@ -389,18 +403,20 @@ def chat(
     #     KeyboardInterrupt, which _stream_turn turns into a _TurnInterrupted
     #     carrying the partial response; the loop below catches it to keep the
     #     partial turn and add an interruption note;
-    #   * while a remote tool is running it only flags the cancellation
-    #     instead of raising, so the blocking socket read is retried (PEP 475)
-    #     and the tool runs to completion.  The loop then appends the tool's
-    #     result before stopping and returning to the prompt.
+    #   * while a remote tool is running it sets the cancel event instead of
+    #     raising; the remote read loop watches that event, asks the server to
+    #     cancel the tool, and the call is stopped -- an interruption note is
+    #     appended in its place before stopping and returning to the prompt.
     #
     # A Ctrl+C *at the >>> prompt* is in neither phase, so the handler raises
     # and input() ends the session as before.
-    loop = {"in_tool_call": False, "cancel": False}
+    loop: dict[str, Any] = {"in_tool_call": False, "cancel": threading.Event()}
 
     def _on_sigint(signum: int, frame: Any) -> None:
         if loop["in_tool_call"]:
-            loop["cancel"] = True
+            # A user interrupt *during* a tool call: flag cancellation so the
+            # remote read loop asks the server to cancel the in-flight tool.
+            loop["cancel"].set()
         else:
             raise KeyboardInterrupt
 
@@ -423,7 +439,8 @@ def chat(
                 continue               # empty line: just prompt again
 
             messages.append({"role": "user", "content": prompt})
-            loop["cancel"] = False
+            # Clear any stale cancel from a previous turn before a new one.
+            loop["cancel"].clear()
 
             # The model may request a tool call instead of answering.  Loop: call
             # the model; if it asks for a tool, run it (forwarding the call back to
@@ -520,36 +537,48 @@ def chat(
                             # Show the call and its arguments *before* running the tool,
                             # then print the result it produced -- request, then response.
                             print(_white(f"[*] Tool call: {name} {_preview(json.dumps(arguments))}"))
-                            # Defer a Ctrl+C for the duration of this call: while this
-                            # flag is set the SIGINT handler only records the
-                            # cancellation (it does not raise), so the blocking read is
-                            # retried and the tool finishes; the request is honoured
-                            # below, after its result has been recorded.
+                            # While this call runs the SIGINT handler sets loop["cancel"]
+                            # (a threading.Event) instead of raising; the remote read
+                            # loop watches it and asks the server to cancel the tool,
+                            # which is then stopped and reported as interrupted.
                             loop["in_tool_call"] = True
+                            loop["cancel"].clear()
                             try:
-                                result = _invoke_tool(call_tool, tool_call)
+                                result = _invoke_tool(call_tool, tool_call, loop["cancel"])
+                            except RemoteToolInterrupt:
+                                # The user interrupted this tool: the server cancelled
+                                # it and returned a cancelled envelope.  Record the
+                                # interruption as the tool's result so the transcript
+                                # stays coherent, then stop the batch and return to the
+                                # prompt.
+                                print()
+                                print(_grey("[*] Interrupted by the user; the tool call was cancelled."))
+                                messages.append({"role": "tool", "content": "[Interrupted by the user]"})
+                                cancelled = True
+                                break
                             finally:
                                 loop["in_tool_call"] = False
                             print()  # blank line between the call and its result
                             print(_white(f"[*] Tool result: {name} {_preview(result)}"))
                             messages.append({"role": "tool", "content": result})
-                            # A Ctrl+C that landed *during* this tool call: the result
-                            # is recorded, but stop the batch and return to the prompt.
-                            if loop["cancel"]:
+                            # Backstop: if a cancel was flagged but the server didn't
+                            # honour it (e.g. an older server that ignores cancel), the
+                            # call ran to completion -- still stop the batch.
+                            if loop["cancel"].is_set():
                                 print()
                                 print(_grey("[*] Interrupted after the current tool call; returning to the prompt."))
                                 cancelled = True
                                 break
                     except KeyboardInterrupt:
                         # A Ctrl+C that landed *between* tool calls (not inside one)
-                        # cancels the batch.  Any in-flight call was already deferred
-                        # to completion, so nothing is left running.
+                        # cancels the batch.  No call is in flight, so nothing is left
+                        # running.
                         print()
                         print(_grey("[*] Interrupted; returning to the prompt."))
                         cancelled = True
                     finally:
                         loop["in_tool_call"] = False
-                        loop["cancel"] = False
+                        loop["cancel"].clear()
 
                     if cancelled:
                         # Cancelled this batch: return to the >>> prompt without
@@ -630,12 +659,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"[*] {len(manifest)} tool command(s) advertised to the model: {names}")
 
-            def call_tool(name: str, arguments: dict[str, Any]) -> Any:
-                # Forward the model's tool call to the remote server.
-                # `name` is the tool name (e.g. "web_search"); `arguments`
-                # carries that tool's parameters, which the server routes
-                # directly to the matching function.
-                return tools.call(name, **arguments)
+            def call_tool(
+                name: str,
+                arguments: dict[str, Any],
+                *,
+                cancel: threading.Event | None = None,
+            ) -> Any:
+                # Forward the model's tool call to the remote server.  `name` is
+                # the tool name (e.g. "web_search"); `arguments` carries that
+                # tool's parameters, which the server routes directly to the
+                # matching function.  `cancel` lets the harness ask the server to
+                # interrupt an in-flight call on a user Ctrl+C.
+                return tools.call(name, **arguments, cancel=cancel)
 
             # Run the interactive chat session while tools is alive.
             chat(

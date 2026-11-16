@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -92,6 +93,7 @@ class SSHConnection:
     port: int
     username: str
     key_filename: str
+    login_shell: bool = False
 
     @property
     def target(self) -> str:
@@ -118,6 +120,21 @@ class SSHConnection:
             args += ["-i", self.key_filename]
         args += ["-o", "StrictHostKeyChecking=accept-new"]
         return args
+
+    def wrap_remote_cmd(self, cmd: str) -> str:
+        """
+        Wrap *cmd* so it runs in a login shell on the remote host.
+
+        When :attr:`login_shell` is *True* the command is wrapped in
+        ``bash -lc`` so that the user's login profile
+        (``.bash_profile``, ``.profile``, ``.bash_login``) is sourced
+        before the command runs, giving it the same environment as an
+        interactive login session.  When *False* the command is returned
+        unchanged.
+        """
+        if self.login_shell:
+            return f"bash -lc {shlex.quote(cmd)}"
+        return cmd
 
 
 @dataclass
@@ -148,6 +165,7 @@ class VMSSHConfig(SSHConnection):
     port: int = 22
     username: str = _LOCAL_ENV.get("VM_SSH_USER", "deploy")
     key_filename: str = os.path.expanduser(_LOCAL_ENV.get("VM_SSH_KEY", ""))
+    login_shell: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -376,9 +394,8 @@ class OllamaTunnel:
 # The minimum Python version the VM's python3 must be for the tools server.
 _MIN_PYTHON_VERSION: tuple[int, int] = (3, 12)
 
-# The Python interpreter path on the VM.  An absolute path avoids
-# PATH surprises on the remote host.
-_PYTHON_BIN = "/Library/Frameworks/Python.framework/Versions/3.15/bin/python3"
+# The Python interpreter on the VM; resolved via PATH.
+_PYTHON_BIN = "python3"
 
 class RemoteTools:
     """
@@ -444,7 +461,7 @@ class RemoteTools:
         ``RuntimeError``.  When *check* is False the call is best-effort
         and the returncode is simply ignored.
         """
-        argv = self._vm.base_args() + [self._vm.target, cmd]
+        argv = self._vm.base_args() + [self._vm.target, self._vm.wrap_remote_cmd(cmd)]
         proc = subprocess.run(
             argv,
             stdout=subprocess.PIPE,
@@ -576,7 +593,7 @@ class RemoteTools:
         """
         probe = f"{_PYTHON_BIN} -c 'import {dep.import_name}'"
         proc = subprocess.run(
-            self._vm.base_args() + [self._vm.target, probe],
+            self._vm.base_args() + [self._vm.target, self._vm.wrap_remote_cmd(probe)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             timeout=30.0,
@@ -604,7 +621,9 @@ class RemoteTools:
         and runs ``python3 ~/tools/tools.py`` as the remote command.  When this
         SSH process is terminated, the remote server dies with it.
         """
-        remote_cmd = f"{_PYTHON_BIN} ~/tools/tools.py --port {self._remote_port}"
+        remote_cmd = self._vm.wrap_remote_cmd(
+            f"{_PYTHON_BIN} ~/tools/tools.py --port {self._remote_port}",
+        )
         cmd = build_tunnel_args(
             self._vm, self._local_port, "127.0.0.1", self._remote_port,
             remote_cmd=remote_cmd,

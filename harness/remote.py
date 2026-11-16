@@ -740,7 +740,7 @@ class RemoteTools:
         error) — in which case the caller should fall back to killing the
         SSH session.
         """
-        print("[*] [tools] requesting graceful shutdown ...")
+        print("[*] [tools] requesting shutdown ...")
         try:
             raw = self._send_request({"method": "shutdown"}, timeout=timeout)
         except OSError as exc:

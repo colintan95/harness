@@ -34,16 +34,22 @@ CLI flags (``--key``, ``--system``) override those settings or carry values
 that are not part of ``local.env``.
 
 The program opens an interactive chat: a ``>>>`` prompt reads your input,
-forwards it to the model, prints the reply, and repeats until you press
-Ctrl+C.
+forwards it to the model, prints the reply, and repeats.  Ctrl+C *at the
+prompt* quits the session, while Ctrl+C *while the agent is working* (a model
+stream or a tool call) cancels the in-flight request and returns to the
+prompt (a Ctrl+C while the model is streaming keeps the user's prompt and the
+partial response/thought already generated, plus a note that the turn was
+interrupted).  Ctrl+D / EOF also quits.
 
 Usage
 -----
     python harness.py
 
 This opens an interactive session: type a message at the ``>>>`` prompt, the
-reply is printed, and you are prompted again.  Press Ctrl+C (or Ctrl+D) to
-quit.
+reply is printed, and you are prompted again.  Press Ctrl+C (or Ctrl+D) at the
+prompt to quit; press Ctrl+C while the model is streaming to keep the partial
+response and thought (plus an interruption note) and return to the prompt, or
+while a tool call is running to finish that call and return to the prompt.
 
 Examples
 --------
@@ -60,10 +66,12 @@ Examples
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import signal
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Optional, TypeAlias, Union
 
 import requests
@@ -118,6 +126,27 @@ JsonType: TypeAlias = Union[
 
 
 # ---------------------------------------------------------------------------
+# SIGINT scoping
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _signal_scope(
+    handler: Callable[[int, Any], None],
+) -> Iterator[None]:
+    """
+    Install *handler* for SIGINT for the duration of a ``with`` block.
+
+    The handler currently installed on entry is saved and restored on exit, so
+    the block's signal behaviour does not leak past it.
+    """
+    prev = signal.signal(signal.SIGINT, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+
+# ---------------------------------------------------------------------------
 # Ollama /api/show – capability probe
 # ---------------------------------------------------------------------------
 def model_supports_think(
@@ -155,6 +184,20 @@ class _Turn(NamedTuple):
     thinking: list[str]
     tool_calls: list[dict[str, Any]]
     total_tokens: int
+
+
+class _TurnInterrupted(KeyboardInterrupt):
+    """
+    A model stream interrupted by the user (Ctrl+C mid-generation).
+
+    Carries the partial :class:`_Turn` assembled so far -- whatever content,
+    thinking and tool calls had already streamed -- so the caller can commit it
+    to the transcript instead of discarding the in-flight turn.
+    """
+
+    def __init__(self, turn: "_Turn") -> None:
+        super().__init__()
+        self.turn = turn
 
 
 def _stream_turn(
@@ -195,47 +238,56 @@ def _stream_turn(
     # stream=True + iter_lines(): Ollama emits NDJSON, one partial message
     # object per line, finished by a {"done": true} line.
     print()  # blank line before the response
-    with requests.post(
-        f"{base_url}/api/chat",
-        json=payload,
-        stream=True,
-        timeout=timeout,
-    ) as r:
-        r.raise_for_status()
-        for line in r.iter_lines():
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            msg = obj.get("message", {})
-            # Reasoning models stream their "thoughts" into message.thinking;
-            # print them in grey so they aren't confused with the answer.
-            thought = msg.get("thinking")
-            if thought:
-                thinking.append(thought)
-                print(_grey(thought), end="", flush=True)
-            chunk = msg.get("content", "")
-            if chunk:
-                # Move to a new line when transitioning from thinking to the
-                # actual response so they don't share a line.
-                if thinking and not content:
-                    print()
-                    print()  # extra blank line after the thinking section
-                content.append(chunk)
-                print(chunk, end="", flush=True)  # print token-by-token
-            # A model that wants to act reports its requests under
-            # message.tool_calls.  Ollama puts the complete list in the final
-            # chunk, so take the latest rather than accumulating it.
-            calls = msg.get("tool_calls")
-            if calls:
-                tool_calls = calls
-            if obj.get("done"):
-                total_tokens = (
-                    obj.get("prompt_eval_count", 0) + obj.get("eval_count", 0)
-                )
-                break
+    try:
+        with requests.post(
+            f"{base_url}/api/chat",
+            json=payload,
+            stream=True,
+            timeout=timeout,
+        ) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = obj.get("message", {})
+                # Reasoning models stream their "thoughts" into message.thinking;
+                # print them in grey so they aren't confused with the answer.
+                thought = msg.get("thinking")
+                if thought:
+                    thinking.append(thought)
+                    print(_grey(thought), end="", flush=True)
+                chunk = msg.get("content", "")
+                if chunk:
+                    # Move to a new line when transitioning from thinking to the
+                    # actual response so they don't share a line.
+                    if thinking and not content:
+                        print()
+                        print()  # extra blank line after the thinking section
+                    content.append(chunk)
+                    print(chunk, end="", flush=True)  # print token-by-token
+                # A model that wants to act reports its requests under
+                # message.tool_calls.  Ollama puts the complete list in the final
+                # chunk, so take the latest rather than accumulating it.
+                calls = msg.get("tool_calls")
+                if calls:
+                    tool_calls = calls
+                if obj.get("done"):
+                    total_tokens = (
+                        obj.get("prompt_eval_count", 0) + obj.get("eval_count", 0)
+                    )
+                    break
+    except KeyboardInterrupt:
+        # The user interrupted mid-generation: hand back whatever had already
+        # streamed (content, thinking, partial tool calls) as a _TurnInterrupted
+        # so the caller can keep it in the transcript instead of discarding the
+        # turn.
+        raise _TurnInterrupted(
+            _Turn(content, thinking, tool_calls, total_tokens)
+        ) from None
 
     print()  # newline so the next prompt starts on a fresh line
     return _Turn(content, thinking, tool_calls, total_tokens)
@@ -293,8 +345,15 @@ def chat(
 
     Prints a ``>>>`` prompt, reads a user turn from stdin, POSTs the growing
     conversation to the remote Ollama server, streams the model's reply
-    token-by-token, and repeats.  Runs until the user interrupts with Ctrl+C
-    (or Ctrl+D / EOF).
+    token-by-token, and repeats.  A Ctrl+C (or Ctrl+D / EOF) *at the prompt*
+    ends the session.
+
+    A Ctrl+C *while the agent is working* returns to the prompt instead of
+    quitting: during a model stream the in-flight request is aborted but the
+    user's prompt and the partial response/thought already generated are kept,
+    together with a note that the turn was interrupted by the user; during a
+    tool call the current call is allowed to finish, its result is appended to
+    the conversation, and *then* the loop stops and returns to the prompt.
 
     When *tools* (the manifest the remote server advertised) is given, it is
     forwarded to the model under ``tools``; when the model requests a tool
@@ -310,7 +369,8 @@ def chat(
     if system:
         messages.append({"role": "system", "content": system})
 
-    print(f"[*] Chat with model '{model}'. Press Ctrl+C to quit.")
+    print(f"[*] Chat with model '{model}'. Ctrl+C at the prompt quits; "
+          "Ctrl+C during a response cancels the request and returns to the prompt.")
 
     # Probe the model to see whether it actually produces thinking / reasoning content.
     supports_think = model_supports_think(base_url, model)
@@ -320,97 +380,196 @@ def chat(
         print(_grey(f"[*] Model '{model}' does not support think."))
 
     print()  # separator before the first prompt
-    while True:
-        # Read a user turn.  input() raises KeyboardInterrupt on Ctrl+C and
-        # EOFError on Ctrl+D / end-of-input; either ends the session.
-        try:
-            prompt = input(">>> ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print()                 # move to a fresh line after the interrupt
-            print()
-            print("[*] Bye.")
-            return
 
-        if not prompt:
-            continue               # empty line: just prompt again
+    # A Ctrl+C during the agent loop should *cancel the current request* and
+    # return to the >>> prompt rather than quitting the whole session.  We
+    # install a SIGINT handler that behaves differently by phase:
+    #
+    #   * while the model is streaming (not inside a tool call) it raises
+    #     KeyboardInterrupt, which _stream_turn turns into a _TurnInterrupted
+    #     carrying the partial response; the loop below catches it to keep the
+    #     partial turn and add an interruption note;
+    #   * while a remote tool is running it only flags the cancellation
+    #     instead of raising, so the blocking socket read is retried (PEP 475)
+    #     and the tool runs to completion.  The loop then appends the tool's
+    #     result before stopping and returning to the prompt.
+    #
+    # A Ctrl+C *at the >>> prompt* is in neither phase, so the handler raises
+    # and input() ends the session as before.
+    loop = {"in_tool_call": False, "cancel": False}
 
-        messages.append({"role": "user", "content": prompt})
+    def _on_sigint(signum: int, frame: Any) -> None:
+        if loop["in_tool_call"]:
+            loop["cancel"] = True
+        else:
+            raise KeyboardInterrupt
 
-        # The model may request a tool call instead of answering.  Loop: call
-        # the model; if it asks for a tool, run it (forwarding the call back to
-        # the remote tools server via *call_tool*) and feed the result back as a
-        # "tool" message; repeat until it produces a final answer.
-        committed = False
+    # Scope the handler to this REPL: _signal_scope installs it for the block
+    # body and restores the previous handler on exit (Ctrl+C / EOF at the
+    # prompt, a return, or an exception), so the behaviour does not leak
+    # past chat().
+    with _signal_scope(_on_sigint):
         while True:
+            # Read a user turn.  input() raises KeyboardInterrupt on Ctrl+C and
+            # EOFError on Ctrl+D / end-of-input; either ends the session.
             try:
-                turn = _stream_turn(
-                    base_url,
-                    model,
-                    messages,
-                    tools=tools,
-                    supports_think=supports_think,
-                    timeout=timeout,
-                )
-            except KeyboardInterrupt:
-                # Interrupted mid-stream: drop to a fresh line, print a goodbye,
-                # and return so the with-blocks in main() close the tunnels.
+                prompt = input(">>> ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print()                 # move to a fresh line after the interrupt
                 print()
-                print()
-                print("[*] Bye.")
                 return
-            except requests.RequestException as exc:
-                print(f"[!] request failed: {exc}")
-                # Drop the user turn only if nothing for it was committed yet, so
-                # a failure mid tool-loop can't corrupt the transcript.
-                if not committed:
-                    messages.pop()
-                break
 
-            committed = True
-            print()
-            print(f"[*] Tokens: {turn.total_tokens}")
-            print()  # separator after tokens, before the next response
+            if not prompt:
+                continue               # empty line: just prompt again
 
-            if turn.tool_calls and call_tool is not None:
-                # The model requested a tool: record its request, run each tool,
-                # and feed every result back so the next call can use them.
-                assistant_msg: dict[str, Any] = {
+            messages.append({"role": "user", "content": prompt})
+            loop["cancel"] = False
+
+            # The model may request a tool call instead of answering.  Loop: call
+            # the model; if it asks for a tool, run it (forwarding the call back to
+            # the remote tools server via *call_tool*) and feed the result back as a
+            # "tool" message; repeat until it produces a final answer.
+            committed = False
+            while True:
+                try:
+                    turn = _stream_turn(
+                        base_url,
+                        model,
+                        messages,
+                        tools=tools,
+                        supports_think=supports_think,
+                        timeout=timeout,
+                    )
+                except _TurnInterrupted as exc:
+                    # Ctrl+C while the model was streaming (not in a tool call):
+                    # keep the user's prompt and whatever response/thought had
+                    # already streamed, and add a note that the turn was
+                    # interrupted, then return to the >>> prompt instead of
+                    # quitting the session.
+                    turn = exc.turn
+                    print()
+                    print()
+                    print(_grey("[*] Interrupted by the user; keeping the partial response and thought."))
+                    # Commit the partial assistant turn -- its content and
+                    # thinking, but not the unreliable in-flight tool calls -- so
+                    # the next turn can build on what was already generated.
+                    if turn.content or turn.thinking:
+                        partial: dict[str, Any] = {
+                            "role": "assistant",
+                            "content": "".join(turn.content),
+                        }
+                        if turn.thinking:
+                            partial["thinking"] = "".join(turn.thinking)
+                        messages.append(partial)
+                    # Tell the agent the prompt was interrupted by the user so it
+                    # can acknowledge it and await new instructions.
+                    messages.append({
+                        "role": "user",
+                        "content": "[Interrupted by the user]",
+                    })
+                    break
+                except KeyboardInterrupt:
+                    # A bare interrupt that bypassed _stream_turn's handler:
+                    # cancel this request and return to the >>> prompt instead of
+                    # quitting the session, leaving the transcript as it was.
+                    print()
+                    print()
+                    print(_grey("[*] Request cancelled; returning to the prompt."))
+                    if not committed:
+                        messages.pop()
+                    break
+                except requests.RequestException as exc:
+                    print(f"[!] request failed: {exc}")
+                    # Drop the user turn only if nothing for it was committed yet, so
+                    # a failure mid tool-loop can't corrupt the transcript.
+                    if not committed:
+                        messages.pop()
+                    break
+
+                committed = True
+                print()
+                print(f"[*] Tokens: {turn.total_tokens}")
+                print()  # separator after tokens, before the next response
+
+                if turn.tool_calls and call_tool is not None:
+                    # The model requested a tool: record its request, run each tool,
+                    # and feed every result back so the next call can use them.
+                    assistant_msg: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": "".join(turn.content),
+                        "tool_calls": turn.tool_calls,
+                    }
+                    if turn.thinking:
+                        assistant_msg["thinking"] = "".join(turn.thinking)
+                    messages.append(assistant_msg)
+
+                    # Run each requested tool, recording its result as a "tool"
+                    # message.  A Ctrl+C cancels the *batch*: if it lands during a
+                    # call that call is deferred to completion and its result is
+                    # appended first; either way we then stop and return to the
+                    # prompt rather than re-querying the model.
+                    cancelled = False
+                    try:
+                        for tool_call in turn.tool_calls:
+                            function = tool_call.get("function", {})
+                            arguments = function.get("arguments") or {}
+                            # The model calls the single `tools` command; the actual
+                            # tool it picked is named under arguments["name"], so show
+                            # that (falling back to the command name).
+                            name = arguments.get("name") or function.get("name", "?")
+                            # Show the call and its arguments *before* running the tool,
+                            # then print the result it produced -- request, then response.
+                            print(_white(f"[*] Tool call: {name} {_preview(json.dumps(arguments))}"))
+                            # Defer a Ctrl+C for the duration of this call: while this
+                            # flag is set the SIGINT handler only records the
+                            # cancellation (it does not raise), so the blocking read is
+                            # retried and the tool finishes; the request is honoured
+                            # below, after its result has been recorded.
+                            loop["in_tool_call"] = True
+                            try:
+                                result = _invoke_tool(call_tool, tool_call)
+                            finally:
+                                loop["in_tool_call"] = False
+                            print()  # blank line between the call and its result
+                            print(_white(f"[*] Tool result: {name} {_preview(result)}"))
+                            messages.append({"role": "tool", "content": result})
+                            # A Ctrl+C that landed *during* this tool call: the result
+                            # is recorded, but stop the batch and return to the prompt.
+                            if loop["cancel"]:
+                                print()
+                                print(_grey("[*] Interrupted after the current tool call; returning to the prompt."))
+                                cancelled = True
+                                break
+                    except KeyboardInterrupt:
+                        # A Ctrl+C that landed *between* tool calls (not inside one)
+                        # cancels the batch.  Any in-flight call was already deferred
+                        # to completion, so nothing is left running.
+                        print()
+                        print(_grey("[*] Interrupted; returning to the prompt."))
+                        cancelled = True
+                    finally:
+                        loop["in_tool_call"] = False
+                        loop["cancel"] = False
+
+                    if cancelled:
+                        # Cancelled this batch: return to the >>> prompt without
+                        # re-querying the model.
+                        break
+                    # Loop back so the model sees the tool results and can answer.
+                    continue
+
+                # No tool requested: this is the final answer for the user turn.
+                assistant_msg = {
                     "role": "assistant",
                     "content": "".join(turn.content),
-                    "tool_calls": turn.tool_calls,
                 }
+                # Feed the model's reasoning back into the conversation so it can
+                # build on its own chain-of-thought on the next turn.  Ollama emits
+                # reasoning in the "thinking" field, so send it back under the same key.
                 if turn.thinking:
                     assistant_msg["thinking"] = "".join(turn.thinking)
                 messages.append(assistant_msg)
-
-                for tool_call in turn.tool_calls:
-                    function = tool_call.get("function", {})
-                    arguments = function.get("arguments") or {}
-                    # The model calls the single `tools` command; the actual
-                    # tool it picked is named under arguments["name"], so show
-                    # that (falling back to the command name).
-                    name = arguments.get("name") or function.get("name", "?")
-                    # Show the call and its arguments *before* running the tool,
-                    # then print the result it produced -- request, then response.
-                    print(_white(f"[*] Tool call: {name} {_preview(json.dumps(arguments))}"))
-                    result = _invoke_tool(call_tool, tool_call)
-                    print(_white(f"[*] Tool result: {name} {_preview(result)}"))
-                    messages.append({"role": "tool", "content": result})
-                # Loop back so the model sees the tool results and can answer.
-                continue
-
-            # No tool requested: this is the final answer for the user turn.
-            assistant_msg = {
-                "role": "assistant",
-                "content": "".join(turn.content),
-            }
-            # Feed the model's reasoning back into the conversation so it can
-            # build on its own chain-of-thought on the next turn.  Ollama emits
-            # reasoning in the "thinking" field, so send it back under the same key.
-            if turn.thinking:
-                assistant_msg["thinking"] = "".join(turn.thinking)
-            messages.append(assistant_msg)
-            break
+                break
 
 
 # ---------------------------------------------------------------------------

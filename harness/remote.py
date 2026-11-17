@@ -712,6 +712,7 @@ class RemoteTools:
             self._vm, self._local_port, "127.0.0.1", self._remote_port,
             remote_cmd=remote_cmd,
         )
+        print(f"[*] [tools] remote working directory: {self._shell_work_dir}")
         print(f"[*] [tools] ssh -L 127.0.0.1:{self._local_port} -> "
               f"127.0.0.1:{self._remote_port} (running {remote_cmd})")
 

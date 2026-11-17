@@ -37,8 +37,9 @@ CLI flags (``--key``, ``--system``) override those settings or carry values
 that are not part of ``local.env``.
 
 The program opens an interactive chat: a ``>>>`` prompt reads your input,
-forwards it to the model, prints the reply, and repeats.  Ctrl+C *at the
-prompt* quits the session, while Ctrl+C *while the agent is working* (a model
+forwards it to the model, prints the reply, and repeats.  At the *prompt*,
+the first Ctrl+C clears the input buffer and a second Ctrl+C (on the now
+empty buffer) quits the session; Ctrl+C *while the agent is working* (a model
 stream or a tool call) cancels the in-flight request and returns to the
 prompt (a Ctrl+C while the model is streaming keeps the user's prompt and the
 partial response/thought already generated, plus a note that the turn was
@@ -49,8 +50,9 @@ Usage
     python harness.py
 
 This opens an interactive session: type a message at the ``>>>`` prompt, the
-reply is printed, and you are prompted again.  Press Ctrl+C (or Ctrl+D) at the
-prompt to quit; press Ctrl+C while the model is streaming to keep the partial
+reply is printed, and you are prompted again.  Press Ctrl+C twice (or
+Ctrl+D) at the prompt to quit -- the first press clears the input; press
+Ctrl+C while the model is streaming to keep the partial
 response and thought (plus an interruption note) and return to the prompt, or
 while a tool call is running to cancel that call and return to the prompt.
 
@@ -75,10 +77,21 @@ import os
 import signal
 import sys
 import threading
+
+try:
+    import termios
+    import tty
+    _HAVE_TERMIOS = True
+except ImportError:
+    _HAVE_TERMIOS = False
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Optional, TypeAlias, Union
 
 import requests
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
 
 
 # SSH tunneling, the remote-tools lifecycle, and their configuration live in
@@ -361,8 +374,8 @@ def chat(
 
     Prints a ``>>>`` prompt, reads a user turn from stdin, POSTs the growing
     conversation to the remote Ollama server, streams the model's reply
-    token-by-token, and repeats.  A Ctrl+C (or Ctrl+D / EOF) *at the prompt*
-    ends the session.
+    token-by-token, and repeats.  At the *prompt* the first Ctrl+C clears the
+    input buffer; a second Ctrl+C (or Ctrl+D / EOF) ends the session.
 
     A Ctrl+C *while the agent is working* returns to the prompt instead of
     quitting: during a model stream the in-flight request is aborted but the
@@ -386,8 +399,9 @@ def chat(
     if system:
         messages.append({"role": "system", "content": system})
 
-    print(f"[*] Chat with model '{model}'. Ctrl+C at the prompt quits; "
-          "Ctrl+C during a response cancels the request and returns to the prompt.")
+    print(f"[*] Chat with model '{model}'. Ctrl+C clears the prompt; "
+          "a second Ctrl+C quits. Ctrl+C during a response cancels the "
+          "request and returns to the prompt.")
 
     # Probe the model to see whether it actually produces thinking / reasoning content.
     supports_think = model_supports_think(base_url, model)
@@ -397,6 +411,66 @@ def chat(
         print(_grey(f"[*] Model '{model}' does not support think."))
 
     print()  # separator before the first prompt
+
+    # prompt_toolkit session for the >>> prompt.
+    #
+    # multiline=True lets the buffer hold newlines, so a pasted
+    # multi-line string (handled via the terminal's bracketed-paste
+    # mode) stays as one input instead of being split into several
+    # turns.  The Ctrl+J binding below lets the user *type* a
+    # newline in the middle of a message without submitting; Enter
+    # still submits as before.  InMemoryHistory gives arrow-key
+    # recall of previous prompts.
+    _pt_bindings = KeyBindings()
+
+    @_pt_bindings.add('c-j')
+    def _pt_insert_newline(event: Any) -> None:
+        """Ctrl+J inserts a newline in multi-line input."""
+        event.current_buffer.insert_text('\n')
+
+    @_pt_bindings.add('enter')
+    def _pt_submit(event: Any) -> None:
+        """
+        Enter submits the prompt when it has content, and is a no-op when
+        the buffer is empty.
+
+        prompt_toolkit's default ``enter`` handler is gated behind a
+        ``not multiline`` filter, so in multi-line mode it only inserts a
+        newline.  This binding overrides that: Enter calls
+        ``validate_and_handle()`` to submit the text when the buffer is
+        non-empty; when the buffer is empty the call is skipped so the
+        user stays on the same ``>>> `` prompt instead of getting a new
+        one.  Ctrl+J remains the way to insert a newline mid-message.
+        """
+        buffer = event.current_buffer
+        if buffer.text:
+            buffer.validate_and_handle()
+
+    @_pt_bindings.add('c-c')
+    @_pt_bindings.add('<sigint>')
+    def _pt_ctrl_c(event: Any) -> None:
+        """
+        Two-stage Ctrl+C at the >>> prompt.
+
+        * First press (buffer has text): clear the input so the user can
+          start over without losing the session.
+        * Second press (buffer is empty): raise ``KeyboardInterrupt`` via
+          ``event.app.exit`` so the surrounding ``prompt()`` call re-raises
+          it and the ``except (KeyboardInterrupt, EOFError)`` block below
+          ends the session -- preserving the current behaviour.
+        """
+        buffer = event.current_buffer
+        if buffer.text:
+            buffer.reset()
+        else:
+            event.app.exit(exception=KeyboardInterrupt())
+
+    _pt_session = PromptSession(
+        history=InMemoryHistory(),
+        multiline=True,
+        prompt_continuation='... ',
+        key_bindings=_pt_bindings,
+    )
 
     # A Ctrl+C during the agent loop should *cancel the current request* and
     # return to the >>> prompt rather than quitting the whole session.  We
@@ -427,12 +501,64 @@ def chat(
     # body and restores the previous handler on exit (Ctrl+C / EOF at the
     # prompt, a return, or an exception), so the behaviour does not leak
     # past chat().
+    @contextlib.contextmanager
+    def _no_echo() -> Iterator[None]:
+        """
+        Suppress terminal echo for the duration of agent output.
+
+        While the model is streaming or a tool is running, prompt_toolkit is
+        not active, so the terminal sits in cooked mode and echoes every
+        key the user presses.  This context manager flips ECHO off so those
+        keystrokes stay invisible, then restores the original settings on
+        exit.  ISIG is left untouched so Ctrl+C still cancels the request.
+        """
+        if not _HAVE_TERMIOS:
+            yield
+            return
+        try:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+        except termios.error:
+            yield
+            return
+        try:
+            new = termios.tcgetattr(fd)
+            new[tty.LFLAG] &= ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSANOW, new)
+            yield
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+
+    def _drain_stdin() -> None:
+        """
+        Discard any characters the user typed while the agent was streaming.
+
+        prompt_toolkit is not reading input during a model response or tool
+        call, so keystrokes sit in the terminal driver's input queue.
+        ``tcflush`` flushes that queue (line buffer + OS buffer) in one call;
+        without it the next prompt() would pick them up and render a spurious
+        newline or partial input at the prompt.
+        """
+        if not _HAVE_TERMIOS:
+            return
+        try:
+            termios.tcflush(0, termios.TCIFLUSH)
+        except termios.error:
+            pass
+
     with _signal_scope(_on_sigint):
+        _first = True
         while True:
-            # Read a user turn.  input() raises KeyboardInterrupt on Ctrl+C and
-            # EOFError on Ctrl+D / end-of-input; either ends the session.
+            # Ring the bell when returning to the prompt after an agent turn.
+            if not _first:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            _first = False
+            _drain_stdin()
+            # Read a user turn.  prompt_toolkit raises KeyboardInterrupt on Ctrl+C
+            # and EOFError on Ctrl+D / end-of-input; either ends the session.
             try:
-                prompt = input(">>> ").strip()
+                prompt = _pt_session.prompt(">>> ").strip()
             except (KeyboardInterrupt, EOFError):
                 print()                 # move to a fresh line after the interrupt
                 print()
@@ -452,14 +578,15 @@ def chat(
             committed = False
             while True:
                 try:
-                    turn = _stream_turn(
-                        base_url,
-                        model,
-                        messages,
-                        tools=tools,
-                        supports_think=supports_think,
-                        timeout=timeout,
-                    )
+                    with _no_echo():
+                        turn = _stream_turn(
+                            base_url,
+                            model,
+                            messages,
+                            tools=tools,
+                            supports_think=supports_think,
+                            timeout=timeout,
+                        )
                 except _TurnInterrupted as exc:
                     # Ctrl+C while the model was streaming (not in a tool call):
                     # keep the user's prompt and whatever response/thought had
@@ -470,6 +597,7 @@ def chat(
                     print()
                     print()
                     print(_grey("[*] Interrupted by the user; keeping the partial response and thought."))
+                    print()
                     # Commit the partial assistant turn -- its content and
                     # thinking, but not the unreliable in-flight tool calls -- so
                     # the next turn can build on what was already generated.
@@ -547,7 +675,8 @@ def chat(
                             loop["in_tool_call"] = True
                             loop["cancel"].clear()
                             try:
-                                result = _invoke_tool(call_tool, tool_call, loop["cancel"])
+                                with _no_echo():
+                                    result = _invoke_tool(call_tool, tool_call, loop["cancel"])
                             except RemoteToolInterrupt:
                                 # The user interrupted this tool: the server cancelled
                                 # it and returned a cancelled envelope.  Record the

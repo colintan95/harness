@@ -11,8 +11,11 @@ locally.  For the VM it runs ``tools.py`` as a remote RPC server over the
 same SSH connection style; VM settings come from ``VM_*`` keys in
 ``local.env``.
 
-It also deploys the ``tools/`` folder to the VM and runs it as a background
-RPC server for the lifetime of the harness.  When the harness exits
+It also deploys ``tools.py`` to the VM's root dir (``VM_ROOT_DIR`` in
+``local.env``, ``~`` by default) and runs it there as a background RPC server
+for the lifetime of the harness, starting in that root dir or in a sub-dir of
+it when a starting directory is passed on the command line.  When the
+harness exits
 (e.g. Ctrl+C) it sends a ``shutdown`` message to ``tools.py`` and waits for
 the tool to confirm it is stopping before closing the SSH session.
 
@@ -618,6 +621,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Model name to chat with (local.env OLLAMA_MODEL, default llama3)")
     p.add_argument("--system", default=None,
                    help="Optional system prompt")
+    p.add_argument("dir", nargs="?", default=None,
+                   help="Optional starting directory: a sub-directory within "
+                        "VM_ROOT_DIR; when given, the tools start there "
+                        "instead of the root dir")
     return p.parse_args(argv)
 
 
@@ -641,12 +648,14 @@ def main(argv: list[str] | None = None) -> int:
     with OllamaTunnel(ssh_cfg, ollama_cfg) as tunnel:
         tunnel.wait_until_ready()
 
-        # Deploy the tools/ folder to the VM and keep it alive for the same
-        # lifetime as the harness.  The context-manager __exit__ asks the
-        # remote process to shut down gracefully (and waits for its
-        # confirmation) when the with-block ends (normal exit, exception,
-        # or KeyboardInterrupt from Ctrl+C in the chat).
-        with RemoteTools(vm_ssh_cfg, tools_cfg) as tools:
+        # Deploy tools.py to the VM's root dir and keep it alive for the same
+        # lifetime as the harness, starting in that dir (or a sub-dir of it
+        # when a starting directory is passed).  The context-manager __exit__
+        # asks the remote
+        # process to shut down gracefully (and waits for its confirmation) when
+        # the with-block ends (normal exit, exception, or KeyboardInterrupt from
+        # Ctrl+C in the chat).
+        with RemoteTools(vm_ssh_cfg, tools_cfg, work_subdir=args.dir) as tools:
             # --- surface the tool manifest to the model ---
             # Ask the remote server for its manifest: one entry per tool
             # (in Ollama's /api/chat "tools" shape), each with its own

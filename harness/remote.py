@@ -11,10 +11,10 @@ This module owns everything that reaches a remote host over the system
   ``_wait_port_ready``);
 * :class:`OllamaTunnel`, which forwards a local port to a remote Ollama
   daemon via ``ssh -L ... -N``; and
-* :class:`RemoteTools`, which forwards a local port *and* runs
-  ``python3 ~/tools/tools.py`` as the remote command over one ``ssh -L``
-  session, first ensuring the server's Python dependencies are installed on
-  the VM (idempotently).
+* :class:`RemoteTools`, which deploys ``tools.py`` into the VM's root dir and
+  runs ``python3 <root>/tools.py --cwd <workdir>`` as the remote command over
+  one ``ssh -L`` session, first ensuring the server's Python dependencies are
+  installed on the VM (idempotently).
 
 ``harness.py`` is the application layer (the chat REPL + CLI) and uses
 these.
@@ -73,7 +73,10 @@ def _load_local_env(path: str) -> dict[str, str]:
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))   # <project>/harness
 _PROJECT_DIR = os.path.dirname(_PKG_DIR)                # <project>
 _LOCAL_ENV = _load_local_env(os.path.join(_PROJECT_DIR, "env", "local.env"))
+# The local tools folder; we deploy its single self-contained module
+# (tools.py) into the VM's root dir rather than the whole folder.
 _TOOLS_DIR = os.path.join(_PROJECT_DIR, "tools")        # <project>/tools
+_TOOLS_FILE = os.path.join(_TOOLS_DIR, "tools.py")      # <project>/tools/tools.py
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +200,11 @@ class ToolsConfig:
     """
     Configuration for the remote ``tools.py`` RPC server.
 
+    * *root_dir*    – the directory on the VM where ``tools.py`` is stored and
+      where the tools' working directory starts.  A leading ``~`` (the
+      default) is accepted and is escaped to ``$HOME`` for the remote-shell
+      commands so the VM's login shell expands it to the user's home
+      (``scp`` expands a leading ``~`` on its own).
     * *remote_port* – the port ``tools.py`` listens on (on the VM).
     * *local_port*  – the local port the harness forwards to via ``ssh -L``.
     * *dependencies* – the Python packages the server imports on the VM.
@@ -205,6 +213,7 @@ class ToolsConfig:
       the existing installation (see
       :meth:`RemoteTools._ensure_dependencies`).
     """
+    root_dir: str = _LOCAL_ENV.get("VM_ROOT_DIR", "~")
     remote_port: int = int(_LOCAL_ENV.get("TOOLS_REMOTE_PORT", "18435"))
     local_port: int = int(_LOCAL_ENV.get("TOOLS_LOCAL_PORT", "18436"))
     dependencies: tuple[ToolDependency, ...] = (
@@ -407,6 +416,23 @@ CANCEL_METHOD = "cancel"
 _READ_INTERVAL = 0.2
 
 
+def _shell_expand_home(path: str) -> str:
+    """
+    Escape a leading ``~`` in *path* to ``$HOME`` for a remote-shell command.
+
+    A literal ``~`` is not expanded when a command is relayed through ``ssh``
+    into the VM's (login) shell, so we hand the shell ``$HOME`` instead: it
+    expands that from the environment to the VM user's home.  Only a bare
+    ``~`` or a leading ``~/`` is rewritten; an already-absolute or already
+    ``$HOME`` value is returned unchanged.
+    """
+    if path == "~":
+        return "$HOME"
+    if path.startswith("~/"):
+        return "$HOME" + path[1:]
+    return path
+
+
 class RemoteToolInterrupt(Exception):
     """
     The remote server cancelled an in-flight tool (a user interrupt).
@@ -428,11 +454,14 @@ class RemoteTools:
     direct (non-nohup) RPC process tied to the SSH connection, so it cannot
     outlive the harness.
 
-    * :meth:`start` copies the whole ``tools/`` folder to ``~/tools`` on the
-      VM, ensures the server's Python dependencies are installed on the VM
-      (installing only what is missing so later runs reuse it), and opens a
-      single ``ssh -L`` connection that both forwards a local port and runs
-      ``python3 ~/tools/tools.py`` as the remote command.
+    * :meth:`start` copies ``tools.py`` into the VM's root dir
+      (``<VM_ROOT_DIR>/tools.py``, ``~`` by default), ensures the server's
+      Python dependencies are installed on the VM (installing only what is
+      missing so later runs reuse it), and opens a single ``ssh -L``
+      connection that both forwards a local port and runs
+      ``python3 <root>/tools.py --cwd <workdir>`` as the remote command,
+      starting in the root dir (or a sub-dir of it when *work_subdir* is
+      given).
     * :meth:`call` connects through the forward and sends a JSON-RPC
       request, returning the ``result`` value.
     * :meth:`get_manifest` asks the server for its tool manifest — one entry per tool (in Ollama's "tools" shape), each with its own
@@ -452,14 +481,30 @@ class RemoteTools:
         self,
         vm_cfg: VMSSHConfig,
         tools_cfg: ToolsConfig | None = None,
+        work_subdir: str | None = None,
     ) -> None:
         self._vm = vm_cfg
         self._tools_cfg = tools_cfg or ToolsConfig()
         self._local_port = self._tools_cfg.local_port
         self._remote_port = self._tools_cfg.remote_port
         self._tunnel: Optional[subprocess.Popen[Any]] = None
-        # Local tools/ folder that gets copied (whole) to the VM.
-        self._tools_dir = _TOOLS_DIR
+        # The local tools.py that gets deployed into the VM's root dir.
+        self._tools_file = _TOOLS_FILE
+        # The root dir on the VM (where tools.py is stored and the default
+        # working dir starts).  When a sub-dir within the root is given, the
+        # working dir starts there instead.
+        self._root_dir = self._tools_cfg.root_dir
+        self._work_dir = (
+            os.path.join(self._root_dir, work_subdir)
+            if work_subdir
+            else self._root_dir
+        )
+        # Two forms of each path: the remote-shell commands ssh relays through
+        # the VM's login shell need a leading ~ escaped to $HOME (the shell
+        # expands it from the environment), while scp expands a leading ~ on
+        # its own, so the deploy keeps the tilde.
+        self._shell_root_dir = _shell_expand_home(self._root_dir)
+        self._shell_work_dir = _shell_expand_home(self._work_dir)
 
     # -- context-manager ---------------------------------------------------
 
@@ -505,13 +550,13 @@ class RemoteTools:
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        """Copy the tools/ folder to the VM and start it over one SSH conn."""
+        """Deploy tools.py to the VM and start it over one SSH conn."""
         # 0. Verify the VM's python3 meets the minimum version before any
         #    remote Python work (dependency probing, pip install, server
         #    launch).
         self._check_python_version()
 
-        # 1. Copy the whole tools/ folder to ~/tools on the VM.
+        # 1. Create the root dir on the VM and copy tools.py into it.
         self._deploy()
 
         # 2. Ensure the server's Python dependencies are installed on the
@@ -523,18 +568,23 @@ class RemoteTools:
         self._open_tunnel()
 
     def _deploy(self) -> None:
-        """Copy the local ``tools/`` folder to ``~/tools`` on the VM.
+        """Create the root dir on the VM and copy the local ``tools.py`` into it.
 
-        The whole folder is deployed (not just ``tools.py``) so the server can
-        import sibling modules.  The destination is removed first so a recursive
-        copy is idempotent across runs.
+        The single ``tools.py`` module is stored directly in the root dir
+        (``<VM_ROOT_DIR>/tools.py``, ``~`` by default) instead of a separate
+        sub-folder.  The working dir (the root, or a sub-dir of it) is created
+        first, idempotently, via the login shell so ``$HOME`` expands, and the
+        file is overwritten, so a later run replaces the deployed copy.
         """
-        remote_dir = f"{self._vm.target}:~/tools"
-        # Start from a clean slate so the recursive copy always wins.
-        self._ssh("rm -rf ~/tools", check=False)
+        # Ensure the working dir exists so both the deploy and the server's
+        # --cwd have somewhere to land.  This runs through the login shell, so
+        # hand it the $HOME form.
+        self._ssh(f'mkdir -p "{self._shell_work_dir}"', check=False)
+        # scp expands a leading ~ on its own, so the deploy keeps the tilde.
+        remote_file = f"{self._vm.target}:{self._root_dir}/tools.py"
         cmd = self._vm.base_args(binary="scp", port_flag="-P")
-        cmd += ["-r", self._tools_dir, remote_dir]
-        print(f"[*] [tools] scp -r {os.path.basename(self._tools_dir)}/ -> {remote_dir}")
+        cmd += [self._tools_file, remote_file]
+        print(f"[*] [tools] scp {os.path.basename(self._tools_file)} -> {remote_file}")
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -543,7 +593,7 @@ class RemoteTools:
         if proc.returncode != 0:
             err = proc.stderr.decode(errors="replace")
             raise RuntimeError(f"[tools] scp failed:\n{err}")
-        print(f"[OK] [tools] copied {os.path.basename(self._tools_dir)}/ to ~/tools.")
+        print(f"[OK] [tools] copied {os.path.basename(self._tools_file)} to {remote_file}.")
 
     # -- pre-flight checks -----------------------------------------------
 
@@ -592,9 +642,10 @@ class RemoteTools:
         dependency is already present, so the existing installation is
         *reused* and nothing is installed.  When it fails, the pip
         *requirement* is installed with ``python3 -m pip install``.  Because
-        the install lands in the VM's Python environment (not the ``~/tools``
-        folder, which :meth:`_deploy` wipes on every run), it persists across
-        runs -- which is what makes the probe skip a later install.
+        the install lands in the VM's Python environment (not the deployed
+        ``tools.py``, which :meth:`_deploy` overwrites on every run), it
+        persists across runs -- which is what makes the probe skip a later
+        install.
         """
         for dep in self._tools_cfg.dependencies:
             if self._dependency_present(dep):
@@ -643,12 +694,20 @@ class RemoteTools:
     def _open_tunnel(self) -> None:
         """
         Start a single ``ssh -L`` connection that both forwards a local port
-        and runs ``python3 ~/tools/tools.py`` as the remote command.  When this
-        SSH process is terminated, the remote server dies with it.
+        and runs ``python3 <root>/tools.py --cwd <workdir>`` as the remote
+        command.  When this SSH process is terminated, the remote server dies
+        with it.
+
+        The path and working dir use the ``$HOME`` form (a leading ``~``
+        escaped to ``$HOME``) so the VM's login shell expands them; each path
+        is double-quoted so a working dir containing spaces stays one argument.
         """
-        remote_cmd = self._vm.wrap_remote_cmd(
-            f"{_PYTHON_BIN} ~/tools/tools.py --port {self._remote_port}",
+        remote_cmd = (
+            f'{_PYTHON_BIN} "{self._shell_root_dir}/tools.py" '
+            f"--port {self._remote_port} "
+            f'--cwd "{self._shell_work_dir}"'
         )
+        remote_cmd = self._vm.wrap_remote_cmd(remote_cmd)
         cmd = build_tunnel_args(
             self._vm, self._local_port, "127.0.0.1", self._remote_port,
             remote_cmd=remote_cmd,

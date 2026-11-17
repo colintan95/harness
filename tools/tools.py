@@ -2,8 +2,9 @@
 """
 tools.py – Remote RPC server managed by the harness.
 
-Copied to the VM as ``~/tools/tools.py`` and run as a direct
-child of the SSH session by :mod:`harness`  (not ``nohup``'d).  It
+Copied to the VM's root dir (``<VM_ROOT_DIR>/tools.py``, ``~`` by default)
+and run as a direct child of the SSH session by :mod:`harness` (not
+``nohup``'d).  It
 listens on a TCP port and accepts newline-delimited JSON requests of
 the form::
 
@@ -46,7 +47,7 @@ sequentially — no threading needed.
 
 Usage (on the VM, normally started by the harness)::
 
-    python3 tools/tools.py --port 18435
+    python3 ~/tools.py --port 18435 --cwd ~/workdir
 """
 
 from __future__ import annotations
@@ -182,7 +183,9 @@ def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
     Execute a *command* string and capture its output.
 
     Runs the command directly via ``subprocess`` on the VM (using the
-    system shell so the string is parsed like a normal command line).
+    system shell so the string is parsed like a normal command line), in the
+    working directory the server was started in -- the VM's root dir, or a
+    sub-dir of it when launched with ``--cwd`` (the child inherits it).
     Returns a dict with the process ``exit_code``, captured ``stdout`` and
     ``stderr`` text, and an ``error`` field that is populated (non-empty)
     when the command fails to start, times out, or is interrupted by the user
@@ -647,7 +650,20 @@ def main() -> None:
         "--port", type=int, default=18435,
         help="Listen port (default 18435)",
     )
+    p.add_argument(
+        "--cwd", default=None,
+        help="Working directory the server starts in; the model-facing tools "
+             "(e.g. run_command) run there.  The harness passes the VM's root "
+             "dir, or a sub-dir of it.",
+    )
     args = p.parse_args()
+
+    # Start in the requested working dir so the model-facing tools (which run
+    # child processes) operate there; they inherit this cwd.  When --cwd is
+    # omitted the server keeps the directory it was launched in.
+    if args.cwd:
+        os.chdir(args.cwd)
+        print(f"[tools] working directory: {os.getcwd()}", flush=True)
 
     serve(args.host, args.port)
 

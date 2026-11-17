@@ -315,15 +315,17 @@ def _invoke_tool(
     call_tool: Callable[..., Any],
     tool_call: dict[str, Any],
     cancel: threading.Event,
-) -> str:
+) -> Any:
     """
-    Run one model-requested tool call and return its result as a string.
+    Run one model-requested tool call and return its result.
 
-    *call_tool* is the harness's forwarder to the remote tools server.  Its
-    return value (often a JSON-friendly list/dict) is serialized to a string
-    for the ``role: "tool"`` message; a tool error is reported back to the
-    model as a JSON error object so it can recover instead of the session
-    crashing.
+    *call_tool* is the harness's forwarder to the remote tools server; it
+    returns the tool's result as a plain dict ``{"content": ..., "images": ...}``
+    (the server's ``ToolResult`` dataclass is converted to a dict on the wire),
+    which the caller (:func:`_tool_message`) stores straight into the
+    ``role: "tool"`` message.  A tool that raises is reported back to the model
+    as a content-only result -- a JSON error object in ``content`` -- so it can
+    recover instead of the session crashing.
 
     *cancel* is a threading.Event the SIGINT handler sets while this call is
     running; it is forwarded to *call_tool* so the remote server can interrupt
@@ -337,16 +339,16 @@ def _invoke_tool(
     if not isinstance(arguments, dict):
         arguments = {}
     try:
-        result = call_tool(name, arguments, cancel=cancel)
+        return call_tool(name, arguments, cancel=cancel)
     except RemoteToolInterrupt:
         # The user cancelled this call; let the chat loop record the
         # interruption rather than turning it into a generic tool error.
         raise
     except Exception as exc:
-        return json.dumps({"error": str(exc)})
-    if isinstance(result, str):
-        return result
-    return json.dumps(result)
+        # Surface the error to the model as a content-only result -- a JSON
+        # error object in "content" -- so it can recover; _tool_message stores
+        # it into the "tool" message.
+        return {"content": json.dumps({"error": str(exc)})}
 
 
 def _preview(text: str, limit: int = 200) -> str:
@@ -355,6 +357,37 @@ def _preview(text: str, limit: int = 200) -> str:
     if len(flat) <= limit:
         return flat
     return flat[:limit].rstrip() + " …"
+
+
+def _tool_message(result: Any) -> dict[str, Any]:
+    """
+    Build the ``role: "tool"`` message from a tool's result.
+
+    Every tool returns the pieces the harness stores straight into the message:
+    ``content`` (its text) and, for view_image, ``images`` -- a list of raw
+    base64 strings for Ollama's per-message ``images`` field, so a vision model
+    actually sees the picture.  The harness does not infer what kind of result it
+    is; it just takes those two fields.  A result that is not in that shape (a
+    tool that raised and was caught in :func:`_invoke_tool`, or some other
+    unexpected value) is degraded to a JSON text blob with no images so the
+    session never crashes.
+    """
+    if isinstance(result, dict) and ("content" in result or "images" in result):
+        # The normal case: a ToolResult-shaped dict.  Guard each field so a
+        # malformed one degrades gracefully rather than crashing the session.
+        content = str(result.get("content") or "")
+        images = [b for b in (result.get("images") or []) if isinstance(b, str)]
+    elif isinstance(result, str):
+        content, images = result, []
+    else:
+        content, images = json.dumps(result), []
+
+    message: dict[str, Any] = {"role": "tool", "content": content}
+    # Attach images only when the tool produced some, so non-vision tools get a
+    # clean text message and the request stays small.
+    if images:
+        message["images"] = images
+    return message
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +423,13 @@ def chat(
     call, *call_tool* runs it and the result is fed back as a ``tool``
     message so the model can continue.  The model is re-queried in a loop
     until it stops requesting tools (the final answer).
+
+    Every tool returns the two fields the harness stores straight into the
+    ``tool`` message: ``content`` (text) and, for ``view_image()``, ``images``
+    -- a list of raw base64 strings (no ``data:`` prefix) for Ollama's
+    per-message ``images`` field, so a vision model actually *sees* the picture
+    rather than reading base64 as text.  The image tool puts a short caption in
+    ``content``; the other tools carry content only.
 
     Ollama loads the model into memory on the first request if it is not
     already in RAM, so the first turn also doubles as a "start model" call.
@@ -674,9 +714,10 @@ def chat(
                             # which is then stopped and reported as interrupted.
                             loop["in_tool_call"] = True
                             loop["cancel"].clear()
+                            raw_result: Any = None
                             try:
                                 with _no_echo():
-                                    result = _invoke_tool(call_tool, tool_call, loop["cancel"])
+                                    raw_result = _invoke_tool(call_tool, tool_call, loop["cancel"])
                             except RemoteToolInterrupt:
                                 # The user interrupted this tool: the server cancelled
                                 # it and returned a cancelled envelope.  Record the
@@ -690,9 +731,15 @@ def chat(
                                 break
                             finally:
                                 loop["in_tool_call"] = False
+                            # The tool returned the pieces the message needs (content,
+                            # and for view_image images); _tool_message stores them
+                            # straight in -- no inference about the result's kind.
+                            tool_message = _tool_message(raw_result)
                             print()  # blank line between the call and its result
-                            print(_white(f"[*] Tool result: {name} {_preview(result)}"))
-                            messages.append({"role": "tool", "content": result})
+                            # Preview the message text (a caption for an image), not a
+                            # multi-kilobyte base64 blob.
+                            print(_white(f"[*] Tool result: {name} {_preview(tool_message['content'])}"))
+                            messages.append(tool_message)
                             # Backstop: if a cancel was flagged but the server didn't
                             # honour it (e.g. an older server that ignores cancel), the
                             # call ran to completion -- still stop the batch.

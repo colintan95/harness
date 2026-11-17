@@ -53,6 +53,7 @@ Usage (on the VM, normally started by the harness)::
 from __future__ import annotations
 
 import argparse
+import base64
 import inspect
 import json
 import os
@@ -62,6 +63,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -138,24 +140,56 @@ _SHUTDOWN = threading.Event()
 
 
 # ---------------------------------------------------------------------------
+# ToolResult – the uniform result every model-facing tool returns
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolResult:
+    """
+    The result a model-facing tool returns -- the two fields the harness stores
+    straight into the ``role: "tool"`` message it feeds back to the model:
+
+    * ``content`` -- the text of the result.  Structured results (web_search,
+      run_command) JSON-serialize their payload here; an image (view_image)
+      puts a short caption here.
+    * ``images`` -- a list of raw base64 image strings for Ollama's per-message
+      ``images`` field (no ``data:`` prefix; the format /api/chat expects).
+      Only view_image populates this, so it defaults to empty and the other
+      tools carry content only.
+
+    Because a tool returns exactly the pieces the message needs, the harness
+    does not have to infer what kind of result it got -- it just reads these
+    two fields.  The result crosses the JSON-RPC wire as a plain dict
+    (:func:`_dataclass_default` converts it on the way out, so the harness
+    receives it back already as ``{"content": ..., "images": ...}``).
+    """
+
+    content: str
+    images: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Tools – the model-facing callables, each advertised in the manifest by name
 # ---------------------------------------------------------------------------
 
-def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
+def web_search(query: str, max_results: int = 5) -> ToolResult:
     """
     Search the web via DuckDuckGo and return up to *max_results* results.
 
     Thin wrapper over ``duckduckgo-search`` (imported as ``ddgs``), the
-    runtime dependency this server pulls in on the VM.  Returns the raw
-    result objects the package produces -- the full dict for each hit
-    (``title``, ``href``/``url``, ``body``, ``source`` and any other
-    fields the current package version emits), with no field filtering.
+    runtime dependency this server pulls in on the VM.  Returns a content-only
+    :class:`ToolResult`: the raw result objects the package produces -- the full
+    dict for each hit (``title``, ``href``/``url``, ``body``, ``source`` and
+    any other fields the current package version emits, with no field
+    filtering) -- JSON-serialized into ``content``.  Web results carry text, so
+    ``images`` stays empty.
     """
     # Coerce to int: LLMs sometimes pass numeric args as strings.
     max_results = int(max_results)
-    # Return the whole result body for each hit (all fields the package
-    # emits) rather than a curated subset.
-    return list(DDGS().text(query, max_results=max_results))
+    # Content only: the whole result body for each hit (all fields the package
+    # emits) JSON-serialized into content; no image.
+    results = list(DDGS().text(query, max_results=max_results))
+    return ToolResult(content=json.dumps(results))
 
 
 def _kill_and_drain(proc: subprocess.Popen[str]) -> tuple[str, str]:
@@ -178,7 +212,7 @@ def _kill_and_drain(proc: subprocess.Popen[str]) -> tuple[str, str]:
     return out or "", err or ""
 
 
-def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
+def run_command(command: str, timeout: float = 30.0) -> ToolResult:
     """
     Execute a *command* string and capture its output.
 
@@ -186,10 +220,11 @@ def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
     system shell so the string is parsed like a normal command line), in the
     working directory the server was started in -- the VM's root dir, or a
     sub-dir of it when launched with ``--cwd`` (the child inherits it).
-    Returns a dict with the process ``exit_code``, captured ``stdout`` and
-    ``stderr`` text, and an ``error`` field that is populated (non-empty)
-    when the command fails to start, times out, or is interrupted by the user
-    instead of running to completion.
+    Returns a content-only :class:`ToolResult`: the process ``exit_code``,
+    captured ``stdout`` and ``stderr`` text, and an ``error`` field that is
+    populated (non-empty) when the command fails to start, times out, or is
+    interrupted by the user instead of running to completion -- JSON-
+    serialized into ``content`` (no image).
     """
     # Coerce to float: LLMs sometimes pass numeric args as strings.
     timeout = float(timeout)
@@ -218,12 +253,12 @@ def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
             start_new_session=True,
         )
     except OSError as exc:
-        return {
+        return ToolResult(content=json.dumps({
             "exit_code": None,
             "stdout": "",
             "stderr": "",
             "error": str(exc),
-        }
+        }))
 
     # Poll communicate() with a short timeout so a user interrupt (CANCEL) can
     # kill the child *mid-run* instead of waiting for the full budget; the same
@@ -236,36 +271,118 @@ def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
         if CANCEL.is_set():
             out, err = _kill_and_drain(proc)
             raise ToolInterrupted(
-                {
+                ToolResult(content=json.dumps({
                     "exit_code": None,
                     "stdout": out,
                     "stderr": err,
                     "error": "interrupted by the user",
-                }
+                }))
             )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             # The command outlived its budget: kill the whole process group so
             # any children the shell spawned are reaped too, then drain.
             out, err = _kill_and_drain(proc)
-            return {
+            return ToolResult(content=json.dumps({
                 "exit_code": None,
                 "stdout": out,
                 "stderr": err,
                 "error": f"command timed out after {timeout}s",
-            }
+            }))
         try:
             out, err = proc.communicate(timeout=min(_POLL, remaining))
             break
         except subprocess.TimeoutExpired:
             continue
 
-    return {
+    return ToolResult(content=json.dumps({
         "exit_code": proc.returncode,
         "stdout": out or "",
         "stderr": err or "",
         "error": None,
-    }
+    }))
+
+
+# ---------------------------------------------------------------------------
+# view_image – read an image off the VM and hand it to the model to see
+# ---------------------------------------------------------------------------
+
+# Default cap on the bytes read for one view_image() call.  Ollama's vision
+# models turn an image into many prompt tokens and the whole request must fit
+# the model's context window, so an unbounded read could produce a payload that
+# is both wasteful and likely to overflow the context.  This is a safety rail,
+# not a policy: it is a parameter with this default so a caller can raise it
+# when it really needs a large image.
+_MAX_IMAGE_BYTES = 16 * 1024 * 1024  # 16 MiB
+
+
+def _image_error(path: str, reason: str, size: int | None = None) -> ToolResult:
+    """
+    A content-only :class:`ToolResult` reporting a ``view_image`` failure.
+
+    The image can't be produced, so the result carries no ``images``; the error
+    (with path and size) is JSON-serialized into ``content`` so the model reads
+    the reason and recovers instead of the session crashing.
+    """
+    return ToolResult(content=json.dumps({"path": path, "size": size, "error": reason}))
+
+
+def view_image(path: str, max_bytes: int = _MAX_IMAGE_BYTES) -> ToolResult:
+    """
+    Read an image off the VM, convert it to the base64 Ollama needs, and
+    return it so the agent can actually *see* the picture.
+
+    This tool runs on the VM, so *path* is resolved on the VM's filesystem --
+    a relative path is taken against the server's working directory (the VM
+    root dir, or a sub-dir of it when the server was launched with --cwd); an
+    absolute path is used as-is.
+
+    On success it returns a :class:`ToolResult` that carries the image in its
+    ``images`` field -- a list of *raw* base64 strings with no ``data:`` URI
+    prefix, the format Ollama's per-message ``images`` field (/api/chat)
+    expects -- so a vision model renders the picture; ``content`` is just a
+    short caption (path, size) so the transcript stays readable instead of a
+    multi-kilobyte blob.  On any failure -- missing file, not readable, larger
+    than *max_bytes* -- it returns a content-only :class:`ToolResult` whose
+    ``content`` is a JSON error (path, size, reason) so the agent reads the
+    reason and recovers instead of the session crashing.
+    """
+    # Coerce: LLMs sometimes pass the size arg as a string.
+    max_bytes = int(max_bytes)
+
+    # Resolve on the VM.  A relative path is taken against the server's current
+    # working directory (set by --cwd); an absolute path is used unchanged.
+    resolved = os.path.abspath(path)
+
+    if not os.path.isfile(resolved):
+        return _image_error(resolved, f"no such file or not a regular file: {resolved!r}")
+
+    try:
+        size = os.path.getsize(resolved)
+    except OSError as exc:
+        return _image_error(resolved, f"could not stat {resolved!r}: {exc}")
+
+    if size > max_bytes:
+        return _image_error(
+            resolved,
+            f"image is {size} bytes, exceeding the {max_bytes}-byte limit; "
+            "downscale it or pass a larger max_bytes",
+            size=size,
+        )
+
+    try:
+        with open(resolved, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        return _image_error(resolved, f"could not read {resolved!r}: {exc}")
+
+    # Ollama wants raw base64 (no "data:..." prefix) and sniffs the format from
+    # the bytes itself, so there is nothing more to do but encode them.  The
+    # image travels in "images"; "content" is a short caption.
+    return ToolResult(
+        content=f"[image] {resolved} ({size:,} bytes) attached for the model to view",
+        images=[base64.b64encode(data).decode("ascii")],
+    )
 
 
 # The model-facing tools.  Each entry gets its own manifest definition so
@@ -274,6 +391,7 @@ def run_command(command: str, timeout: float = 30.0) -> dict[str, Any]:
 TOOLS: dict[str, Callable[..., Any]] = {
     "web_search": web_search,
     "run_command": run_command,
+    "view_image": view_image,
 }
 
 
@@ -325,12 +443,28 @@ _PY_TO_JSON: dict[type, str] = {
     dict: "object",
 }
 
+# PEP 563 (``from __future__ import annotations``) hands signature annotations to
+# ``inspect`` as *strings* ("int", "float", ...), so keep a name->type mirror
+# of the same builtins for the string form.  Derived from _PY_TO_JSON so the
+# two never drift apart.
+_PY_TO_JSON_NAME: dict[str, str] = {
+    t.__name__: js for t, js in _PY_TO_JSON.items()
+}
+
 
 def _json_type(annotation: Any) -> str:
     """Best-effort mapping of a Python type annotation to a JSON Schema type."""
     # Direct match.
     if annotation in _PY_TO_JSON:
         return _PY_TO_JSON[annotation]
+    # Under ``from __future__ import annotations`` (PEP 563) the signature's
+    # annotations arrive as *strings* (e.g. "int", "float") rather than the
+    # live types, so a bare numeric/bool param would otherwise fall through to
+    # "string".  Resolve the common builtin-name forms; anything more complex
+    # (e.g. "list[dict[str, Any]]") is left to the origin/unwrapping below or
+    # the "string" fallback.
+    if isinstance(annotation, str) and annotation in _PY_TO_JSON_NAME:
+        return _PY_TO_JSON_NAME[annotation]
     # typing constructs like list[str], dict[str, Any], Optional[X], etc.
     origin = getattr(annotation, "__origin__", None)
     if origin is not None:
@@ -491,6 +625,19 @@ def serve(host: str, port: int) -> None:
 # Per-connection handling
 # ---------------------------------------------------------------------------
 
+def _dataclass_default(obj: Any) -> Any:
+    """
+    ``json.dumps`` hook so a tool's :class:`ToolResult` crosses the JSON-RPC
+    wire as its plain dict form -- the harness receives it back as
+    ``{"content": ..., "images": ...}``.  ``default`` is only called for objects
+    json can't serialize natively, so plain results (dicts, strings, lists,
+    numbers, ``None``) pass through untouched.
+    """
+    if is_dataclass(obj):
+        return asdict(obj)
+    raise TypeError(f"object of type {type(obj).__name__} is not JSON serializable")
+
+
 def _handle_one(conn: socket.socket) -> None:
     """
     Read one JSON request, dispatch, send the JSON response, close.
@@ -517,7 +664,7 @@ def _handle_one(conn: socket.socket) -> None:
         result_obj = _dispatch(request)
 
         # ---- write response ----
-        payload = json.dumps(result_obj).encode("utf-8") + b"\n"
+        payload = json.dumps(result_obj, default=_dataclass_default).encode("utf-8") + b"\n"
         conn.sendall(payload)
     except Exception as exc:
         # Always try to send an error response so the caller doesn't hang.

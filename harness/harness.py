@@ -33,7 +33,7 @@ Configuration is read from ``env/local.env`` in the project root
 override ``local.env`` values.
 
 Connection and model settings are read from ``local.env``.  The remaining
-CLI flags (``--key``, ``--system``) override those settings or carry values
+CLI flags (``--key``) override those settings or carry values
 that are not part of ``local.env``.
 
 The program opens an interactive chat: a ``>>>`` prompt reads your input,
@@ -61,9 +61,6 @@ Examples
     # key auth via a specific key file
     python harness.py --key ~/.ssh/id_rsa
 
-    # with a system prompt
-    python harness.py --system "You are a helpful assistant."
-
     # override the model (local.env OLLAMA_MODEL)
     python harness.py --model qwen2.5
 """
@@ -85,7 +82,7 @@ try:
 except ImportError:
     _HAVE_TERMIOS = False
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, NamedTuple, Optional, TypeAlias, Union
+from typing import Any, NamedTuple, TypeAlias, Union
 
 import requests
 
@@ -106,6 +103,15 @@ from remote import (
     VMSSHConfig,
 )
 
+# ---------------------------------------------------------------------------
+# Default system prompt
+# ---------------------------------------------------------------------------
+#
+# Always sent as the first message so the agent starts by exploring the
+# project in the tools server's working directory rather than guessing
+# or searching in unrelated paths.
+
+_DEFAULT_SYSTEM_PROMPT = """Look for code and files in the current working directory"""
 
 # ---------------------------------------------------------------------------
 # Terminal colour helpers
@@ -398,7 +404,6 @@ def chat(
     model: str,
     *,
     timeout: float = 300.0,
-    system: Optional[str] = None,
     tools: list[dict[str, Any]] | None = None,
     call_tool: Callable[..., Any] | None = None,
 ) -> None:
@@ -436,8 +441,7 @@ def chat(
     Conversation context is kept between turns.
     """
     messages: list[dict[str, Any]] = []
-    if system:
-        messages.append({"role": "system", "content": system})
+    messages.append({"role": "system", "content": _DEFAULT_SYSTEM_PROMPT})
 
     print(f"[*] Chat with model '{model}'. Ctrl+C clears the prompt; "
           "a second Ctrl+C quits. Ctrl+C during a response cancels the "
@@ -766,8 +770,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="SSH key file (local.env SSH_KEY, optional)")
     p.add_argument("--model", default=None,
                    help="Model name to chat with (local.env OLLAMA_MODEL, default llama3)")
-    p.add_argument("--system", default=None,
-                   help="Optional system prompt")
     p.add_argument("dir", nargs="?", default=None,
                    help="Optional starting directory: a sub-directory within "
                         "VM_ROOT_DIR; when given, the tools start there "
@@ -832,7 +834,6 @@ def main(argv: list[str] | None = None) -> int:
             chat(
                 tunnel.base_url(),
                 ollama_cfg.model,
-                system=args.system,
                 tools=manifest,
                 call_tool=call_tool,
             )

@@ -541,33 +541,6 @@ def chat(
     # body and restores the previous handler on exit (Ctrl+C / EOF at the
     # prompt, a return, or an exception), so the behaviour does not leak
     # past chat().
-    @contextlib.contextmanager
-    def _no_echo() -> Iterator[None]:
-        """
-        Suppress terminal echo for the duration of agent output.
-
-        While the model is streaming or a tool is running, prompt_toolkit is
-        not active, so the terminal sits in cooked mode and echoes every
-        key the user presses.  This context manager flips ECHO off so those
-        keystrokes stay invisible, then restores the original settings on
-        exit.  ISIG is left untouched so Ctrl+C still cancels the request.
-        """
-        if not _HAVE_TERMIOS:
-            yield
-            return
-        try:
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-        except termios.error:
-            yield
-            return
-        try:
-            new = termios.tcgetattr(fd)
-            new[tty.LFLAG] &= ~termios.ECHO
-            termios.tcsetattr(fd, termios.TCSANOW, new)
-            yield
-        finally:
-            termios.tcsetattr(fd, termios.TCSANOW, old)
 
     def _drain_stdin() -> None:
         """
@@ -618,15 +591,14 @@ def chat(
             committed = False
             while True:
                 try:
-                    with _no_echo():
-                        turn = _stream_turn(
-                            base_url,
-                            model,
-                            messages,
-                            tools=tools,
-                            supports_think=supports_think,
-                            timeout=timeout,
-                        )
+                    turn = _stream_turn(
+                        base_url,
+                        model,
+                        messages,
+                        tools=tools,
+                        supports_think=supports_think,
+                        timeout=timeout,
+                    )
                 except _TurnInterrupted as exc:
                     # Ctrl+C while the model was streaming (not in a tool call):
                     # keep the user's prompt and whatever response/thought had
@@ -716,8 +688,7 @@ def chat(
                             loop["cancel"].clear()
                             raw_result: Any = None
                             try:
-                                with _no_echo():
-                                    raw_result = _invoke_tool(call_tool, tool_call, loop["cancel"])
+                                raw_result = _invoke_tool(call_tool, tool_call, loop["cancel"])
                             except RemoteToolInterrupt:
                                 # The user interrupted this tool: the server cancelled
                                 # it and returned a cancelled envelope.  Record the

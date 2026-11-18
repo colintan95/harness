@@ -111,7 +111,7 @@ from remote import (
 # project in the tools server's working directory rather than guessing
 # or searching in unrelated paths.
 
-_DEFAULT_SYSTEM_PROMPT = """Look for code and files in the current working directory"""
+_DEFAULT_SYSTEM_PROMPT = """If looking for code and files, start in the current working directory"""
 
 # ---------------------------------------------------------------------------
 # Terminal colour helpers

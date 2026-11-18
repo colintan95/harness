@@ -385,6 +385,359 @@ def view_image(path: str, max_bytes: int = _MAX_IMAGE_BYTES) -> ToolResult:
     )
 
 
+
+# ---------------------------------------------------------------------------
+# edit_file – apply aider-style SEARCH/REPLACE edits to a file
+# ---------------------------------------------------------------------------
+
+# Markers delimiting a SEARCH/REPLACE block in the diff string.  A full block
+# looks like::
+#
+#     <<<<<<< SEARCH
+#     exact old content here
+#     =======
+#     new content here
+#     >>>>>>> REPLACE
+#
+# Multiple blocks may appear in a single *diff* string, separated by
+# newlines.  Each block is applied in order, so a later block's SEARCH must
+# match the *post-edit* content produced by the earlier blocks.
+_SEARCH_START = "<<<<<<< SEARCH\n"
+_SEP = "=======\n"
+_REPLACE_END = ">>>>>>> REPLACE\n"
+
+
+def _parse_edit_blocks(diff: str) -> list[tuple[str, str]]:
+    """
+    Parse a *diff* string into a list of ``(search, replace)`` pairs.
+
+    Each block is delimited by the fixed markers above.  The content between
+    ``SEARCH`` and ``=======`` is the exact byte sequence to find; the content
+    between ``=======`` and ``REPLACE`` is the replacement.  Raises
+    ``ValueError`` on a malformed block (missing markers, odd structure).
+    """
+    # Normalize: the last block's REPLACE end marker may lack a trailing
+    # newline (the diff string ends at the last character of the marker).
+    # Ensure it ends with one so the fixed _REPLACE_END constant matches.
+    if not diff.endswith("\n"):
+        diff += "\n"
+    blocks: list[tuple[str, str]] = []
+    pos = 0
+    while True:
+        start = diff.find(_SEARCH_START, pos)
+        if start == -1:
+            break
+        # Content after the SEARCH marker up to the ======= separator.
+        sep = diff.find(_SEP, start + len(_SEARCH_START))
+        if sep == -1:
+            raise ValueError(
+                f"malformed block starting at offset {start}: "
+                f"missing '=======' separator"
+            )
+        search_text = diff[start + len(_SEARCH_START):sep]
+
+        end = diff.find(_REPLACE_END, sep + len(_SEP))
+        if end == -1:
+            raise ValueError(
+                f"malformed block starting at offset {start}: "
+                f"missing '>>>>>>> REPLACE' end marker"
+            )
+        replace_text = diff[sep + len(_SEP):end]
+        blocks.append((search_text, replace_text))
+        pos = end + len(_REPLACE_END)
+
+    if not blocks:
+        raise ValueError("no SEARCH/REPLACE blocks found in diff")
+    return blocks
+
+
+def _apply_edit_blocks(
+    content: str,
+    blocks: list[tuple[str, str]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Apply a list of ``(search, replace)`` blocks to *content* in order.
+
+    Each block's *search* is located by an exact (byte-for-byte) substring
+    match in the current content.  If the search string appears more than
+    once the application is ambiguous and a ``ValueError`` is raised so the
+    caller can fix the block.  Returns the edited content and a list of
+    per-block change records (offset, old length, new length) for the result
+    summary.
+    """
+    result = content
+    changes: list[dict[str, Any]] = []
+
+    for i, (search, replace) in enumerate(blocks):
+        count = result.count(search)
+        if count == 0:
+            raise ValueError(
+                f"block {i + 1}: search text not found in file content"
+            )
+        if count > 1:
+            raise ValueError(
+                f"block {i + 1}: search text matches {count} locations "
+                "(ambiguous; make the search more specific)"
+            )
+        offset = result.index(search)
+        old_len = len(search)
+        new_len = len(replace)
+        result = result[:offset] + replace + result[offset + old_len:]
+        changes.append({
+            "block": i + 1,
+            "offset": offset,
+            "old_len": old_len,
+            "new_len": new_len,
+        })
+
+    return result, changes
+
+
+def edit_file(path: str, diff: str) -> ToolResult:
+    """
+    Edit a file by applying one or more aider-style SEARCH/REPLACE blocks.
+
+    The *diff* string contains one or more blocks in the format::
+
+        <<<<<<< SEARCH
+        exact old content to find
+        =======
+        new replacement content
+        >>>>>>> REPLACE
+
+    Each block's SEARCH section is matched by exact byte-for-byte comparison
+    against the file content.  If the match is not unique the edit is
+    rejected so the model can narrow the search.  Blocks are applied in
+    sequence: the result of block *N* becomes the input to block *N+1*.
+
+    *path* is resolved on the VM's filesystem the same way :func:`view_image`
+    resolves its path (relative paths are taken against the server's working
+    directory; absolute paths are used as-is).
+
+    Returns a content-only :class:`ToolResult` whose ``content`` is a JSON
+    summary (file path, number of blocks applied, per-block offsets and
+    lengths, and a diff preview).  On failure the summary carries an
+    ``error`` field explaining what went wrong so the model can recover.
+    """
+    # Resolve on the VM.  A relative path is taken against the server's
+    # working directory; an absolute path is used unchanged.
+    resolved = os.path.abspath(path)
+
+    if not os.path.isfile(resolved):
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"no such file or not a regular file: {resolved!r}",
+        }))
+
+    # Read the entire file as text (the diff works on string content; the
+    # matching is exact-byte at the character level).
+    try:
+        with open(resolved, "r", encoding="utf-8") as fh:
+            original = fh.read()
+    except OSError as exc:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"could not read {resolved!r}: {exc}",
+        }))
+    except UnicodeDecodeError as exc:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"file is not valid UTF-8 text: {exc}",
+        }))
+
+    # Parse the diff into (search, replace) pairs.
+    try:
+        blocks = _parse_edit_blocks(diff)
+    except ValueError as exc:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"failed to parse diff: {exc}",
+        }))
+
+    # Apply blocks in sequence.
+    try:
+        edited, changes = _apply_edit_blocks(original, blocks)
+    except ValueError as exc:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"failed to apply edit: {exc}",
+        }))
+
+    # Write the edited content back to the same file.
+    try:
+        with open(resolved, "w", encoding="utf-8") as fh:
+            fh.write(edited)
+    except OSError as exc:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"could not write {resolved!r}: {exc}",
+        }))
+
+    return ToolResult(content=json.dumps({
+        "path": resolved,
+        "blocks_applied": len(changes),
+        "changes": changes,
+        "original_size": len(original),
+        "new_size": len(edited),
+    }))
+
+
+# ---------------------------------------------------------------------------
+# view_file – read a text file off the VM and return its contents
+# ---------------------------------------------------------------------------
+
+# Default cap on the number of lines returned by one view_file() call.  A very
+# large file would overflow the model's context window, so this is a safety
+# rail (not a hard policy): the caller can raise it when it really needs more.
+_MAX_VIEW_LINES = 500
+
+
+def view_file(path: str, max_lines: int = _MAX_VIEW_LINES) -> ToolResult:
+    """
+    Read a text file off the VM and return its contents.
+
+    This tool runs on the VM, so *path* is resolved on the VM's filesystem --
+    a relative path is taken against the server's working directory (the VM
+    root dir, or a sub-dir of it when the server was launched with --cwd); an
+    absolute path is used as-is.
+
+    Returns a content-only :class:`ToolResult` whose ``content`` is a JSON
+    object carrying the file's text (truncated to *max_lines* lines when the
+    file is longer) along with metadata (path, total line count, total byte
+    size, whether the output was truncated).  On failure the ``content`` is a
+    JSON error object (path, reason) so the model can recover.
+    """
+    # Coerce to int: LLMs sometimes pass numeric args as strings.
+    max_lines = int(max_lines)
+
+    # Resolve on the VM.  A relative path is taken against the server's
+    # working directory; an absolute path is used unchanged.
+    resolved = os.path.abspath(path)
+
+    if not os.path.isfile(resolved):
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"no such file or not a regular file: {resolved!r}",
+        }))
+
+    try:
+        size = os.path.getsize(resolved)
+    except OSError as exc:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"could not stat {resolved!r}: {exc}",
+        }))
+
+    try:
+        with open(resolved, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"could not read {resolved!r}: {exc}",
+        }))
+
+    total_lines = len(lines)
+    truncated = total_lines > max_lines
+    if truncated:
+        lines = lines[:max_lines]
+
+    text = "".join(lines)
+    result: dict[str, Any] = {
+        "path": resolved,
+        "size": size,
+        "lines_returned": len(lines),
+        "total_lines": total_lines,
+        "truncated": truncated,
+        "content": text,
+    }
+    if truncated:
+        result["note"] = (
+            f"file has {total_lines} lines; only the first {max_lines} were "
+            "returned.  Call view_file again with a larger max_lines to see "
+            "the rest."
+        )
+
+    return ToolResult(content=json.dumps(result))
+
+
+# ---------------------------------------------------------------------------
+# add_file – create or overwrite a file with the given content
+# ---------------------------------------------------------------------------
+
+
+def add_file(
+    path: str,
+    content: str,
+    *,
+    create_dirs: bool = True,
+    overwrite: bool = True,
+) -> ToolResult:
+    """
+    Create or overwrite a file on the VM with *content* as its text.
+
+    This tool runs on the VM, so *path* is resolved on the VM's filesystem --
+    a relative path is taken against the server's working directory (the VM
+    root dir, or a sub-dir of it when the server was launched with --cwd); an
+    absolute path is used as-is.
+
+    *create_dirs* (default ``True``) controls whether missing parent
+    directories are created automatically.  *overwrite* (default ``True``)
+    controls whether an existing file is overwritten; when ``False`` the
+    write is refused and an error is returned if the file already exists.
+
+    Returns a content-only :class:`ToolResult` whose ``content`` is a JSON
+    summary (path, bytes written, whether a parent directory was created, and
+    whether an existing file was overwritten).  On failure the summary carries
+    an ``error`` field so the model can recover.
+    """
+    resolved = os.path.abspath(path)
+
+    # Decide whether we need to create the parent directory.
+    parent = os.path.dirname(resolved) or "."
+    created_dir = False
+    if not os.path.isdir(parent):
+        if create_dirs:
+            try:
+                os.makedirs(parent, exist_ok=True)
+                created_dir = True
+            except OSError as exc:
+                return ToolResult(content=json.dumps({
+                    "path": resolved,
+                    "error": f"could not create parent directories for {resolved!r}: {exc}",
+                }))
+        else:
+            return ToolResult(content=json.dumps({
+                "path": resolved,
+                "error": f"parent directory {parent!r} does not exist and create_dirs is False",
+            }))
+
+    # Refuse to overwrite when the caller opted out and the file exists.
+    existed = os.path.exists(resolved)
+    if existed and not overwrite:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"file already exists and overwrite is False: {resolved!r}",
+        }))
+
+    try:
+        with open(resolved, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as exc:
+        return ToolResult(content=json.dumps({
+            "path": resolved,
+            "error": f"could not write {resolved!r}: {exc}",
+        }))
+
+    return ToolResult(content=json.dumps({
+        "path": resolved,
+        "bytes_written": len(content.encode("utf-8")),
+        "lines": content.count("\n") + (0 if content.endswith("\n") or not content else 1),
+        "created_directory": created_dir,
+        "overwritten": existed,
+    }))
+
+
 # The model-facing tools.  Each entry gets its own manifest definition so
 # the model can call it directly by name.  Control commands
 # (``manifest``, ``shutdown``) do not live here — see :data:`CONTROL`.
@@ -392,6 +745,9 @@ TOOLS: dict[str, Callable[..., Any]] = {
     "web_search": web_search,
     "run_command": run_command,
     "view_image": view_image,
+    "edit_file": edit_file,
+    "view_file": view_file,
+    "add_file": add_file,
 }
 
 
@@ -478,13 +834,67 @@ def _json_type(annotation: Any) -> str:
     return "string"
 
 
-def _parameters_schema(fn: Callable[..., Any]) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Per-parameter manifest metadata -- spelling out a parameter the signature
+# alone cannot describe
+# ---------------------------------------------------------------------------
+
+# A single SEARCH/REPLACE block, built from the parser's own marker constants
+# (_SEARCH_START / _SEP / _REPLACE_END in the edit_file section) so the
+# advertised format and _parse_edit_blocks can never drift apart.
+_AIDER_DIFF_EXAMPLE = "".join((
+    _SEARCH_START + "def add(a, b):\n    return a + b\n" + _SEP
+    + "def add(a, b):\n    return a - b\n" + _REPLACE_END,
+    _SEARCH_START + "print(old)\n" + _SEP + "print(new)\n" + _REPLACE_END,
+))
+
+_AIDER_DIFF_DESCRIPTION = (
+    "The text of one or more aider-style SEARCH/REPLACE blocks, separated by "
+    "newlines and applied to the file in order.  Each block begins with a line "
+    "reading \"<<<<<<< SEARCH\", holds the existing content to find (matched "
+    "byte-for-byte, with the markers on their own lines and no leading "
+    "indentation), then a line reading \"=======\", then the replacement "
+    "content, then a line reading \">>>>>>> REPLACE\".  Rules: (1) the SEARCH "
+    "content must occur exactly once in the file -- include enough surrounding "
+    "lines to make it unique, since an absent or ambiguous match is rejected; "
+    "(2) blocks are applied in sequence, so a later block's SEARCH must match "
+    "the content produced by the earlier blocks; (3) the REPLACE section may be "
+    "empty (to delete) and there is no fuzzy matching.  Canonical two-block "
+    "example:\n\n"
+    f"{_AIDER_DIFF_EXAMPLE}"
+)
+
+# Per-parameter JSON Schema metadata, keyed by (tool_name, param_name).  Each
+# value is merged into the auto-generated property for that parameter, so a
+# tool can advertise *exactly* how a string parameter is laid out when the
+# signature (a bare "string") cannot say so.  Currently the only entry spells
+# out the aider-style SEARCH/REPLACE format for edit_file's `diff`.
+_PARAM_OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
+    ("edit_file", "diff"): {
+        "description": _AIDER_DIFF_DESCRIPTION,
+        "example": _AIDER_DIFF_EXAMPLE,
+    },
+}
+
+
+def _parameters_schema(
+    fn: Callable[..., Any],
+    *,
+    tool_name: str = "",
+) -> dict[str, Any]:
     """
     Build a JSON Schema ``parameters`` object for *fn* from its signature.
 
     Each positional or keyword parameter becomes a property; parameters
     without a default are listed in ``required``.  The ``self``/``cls``
     parameters and ``*args``/``**kwargs`` are skipped.
+
+    Beyond the type (and any default) a parameter may carry extra JSON Schema
+    metadata from :data:`_PARAM_OVERRIDES`, keyed by
+    ``(tool_name, param_name)`` -- this is how a tool advertises *exactly* how
+    a string parameter is laid out when the signature alone cannot say so (for
+    instance, ``edit_file``'s ``diff`` carries the precise aider-style
+    SEARCH/REPLACE block format so the model reproduces it correctly).
     """
     sig = inspect.signature(fn)
     properties: dict[str, Any] = {}
@@ -507,6 +917,13 @@ def _parameters_schema(fn: Callable[..., Any]) -> dict[str, Any]:
             prop["default"] = param.default
         else:
             required.append(name)
+
+        # Merge any per-parameter schema overrides (description, example, ...)
+        # so the manifest can specify a parameter's exact layout -- the aider
+        # SEARCH/REPLACE format for edit_file's `diff`, for instance.
+        override = _PARAM_OVERRIDES.get((tool_name, name))
+        if override:
+            prop.update(override)
 
         properties[name] = prop
 
@@ -541,7 +958,7 @@ def _tool_definition(name: str, fn: Callable[..., Any]) -> dict[str, Any]:
         "function": {
             "name": name,
             "description": _short_description(fn),
-            "parameters": _parameters_schema(fn),
+            "parameters": _parameters_schema(fn, tool_name=name),
         },
     }
 

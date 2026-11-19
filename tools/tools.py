@@ -589,7 +589,7 @@ def edit_file(path: str, diff: str) -> ToolResult:
 # Default cap on the number of lines returned by one view_file() call.  A very
 # large file would overflow the model's context window, so this is a safety
 # rail (not a hard policy): the caller can raise it when it really needs more.
-_MAX_VIEW_LINES = 500
+_MAX_VIEW_LINES = 5000
 
 
 def view_file(path: str, max_lines: int = _MAX_VIEW_LINES) -> ToolResult:

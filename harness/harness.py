@@ -74,6 +74,7 @@ import os
 import signal
 import sys
 import threading
+from datetime import datetime
 
 try:
     import termios
@@ -91,16 +92,20 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 
 
-# SSH tunneling, the remote-tools lifecycle, and their configuration live in
-# remote.py; this module is the application layer (chat REPL + CLI).
-from remote import (
+# The env-driven configuration dataclasses (incl. the local.env loader) live in
+# config.py; the SSH tunneling and the remote-tools lifecycle live in remote.py.
+# This module is the application layer (chat REPL + CLI).
+from config import (
+    LogConfig,
     OllamaConfig,
-    OllamaTunnel,
-    RemoteToolInterrupt,
-    RemoteTools,
     SSHConfig,
     ToolsConfig,
     VMSSHConfig,
+)
+from remote import (
+    OllamaTunnel,
+    RemoteToolInterrupt,
+    RemoteTools,
 )
 
 # ---------------------------------------------------------------------------
@@ -399,6 +404,26 @@ def _tool_message(result: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Ollama /api/chat
 # ---------------------------------------------------------------------------
+def _dump_transcript(log_dir: str, messages: Sequence[dict[str, Any]]) -> None:
+    """
+    Write the chat *messages* (the full transcript) to a timestamped JSON
+    file in *log_dir*.
+
+    Logging is opt-in: when *log_dir* is empty -- no ``LOG_DIR`` in
+    ``local.env`` -- this is a no-op.  When it is set the directory is
+    created if it does not exist and the message list is dumped
+    (``json.dump``) into a file named with a timestamp, e.g.
+    ``chat-20260101-123456.json``.
+    """
+    if not log_dir:
+        return
+    path = os.path.join(log_dir, f"chat-{datetime.now():%Y%m%d-%H%M%S}.json")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(messages, fh, indent=2)
+    print(f"[*] Transcript written to {path}")
+
+
 def chat(
     base_url: str,
     model: str,
@@ -406,6 +431,7 @@ def chat(
     timeout: float = 300.0,
     tools: list[dict[str, Any]] | None = None,
     call_tool: Callable[..., Any] | None = None,
+    log_dir: str = "",
 ) -> None:
     """
     Interactive REPL over /api/chat.
@@ -578,6 +604,9 @@ def chat(
                 prompt = _pt_session.prompt(">>> ").strip()
             except (KeyboardInterrupt, EOFError):
                 print()                 # move to a fresh line after the interrupt
+                # Persist the transcript when a log directory is configured;
+                # a no-op when LOG_DIR is unset.
+                _dump_transcript(log_dir, messages)
                 print()
                 return
 
@@ -793,6 +822,7 @@ def main(argv: list[str] | None = None) -> int:
         key_filename=os.path.expanduser(args.key) if args.key else VMSSHConfig().key_filename,
     )
     tools_cfg = ToolsConfig()
+    log_cfg = LogConfig()
 
     with OllamaTunnel(ssh_cfg, ollama_cfg) as tunnel:
         tunnel.wait_until_ready()
@@ -836,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
                 ollama_cfg.model,
                 tools=manifest,
                 call_tool=call_tool,
+                log_dir=log_cfg.dir,
             )
         # ^ when this with-block exits (chat returns on Ctrl+C / EOF),
         #   RemoteTools.__exit__ -> stop() asks the server to shut down

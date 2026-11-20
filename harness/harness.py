@@ -74,7 +74,7 @@ import os
 import signal
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     import termios
@@ -412,12 +412,13 @@ def _dump_transcript(log_dir: str, messages: Sequence[dict[str, Any]]) -> None:
     Logging is opt-in: when *log_dir* is empty -- no ``LOG_DIR`` in
     ``local.env`` -- this is a no-op.  When it is set the directory is
     created if it does not exist and the message list is dumped
-    (``json.dump``) into a file named with a timestamp, e.g.
-    ``chat-20260101-123456.json``.
+    (``json.dump``) into a file named with a UTC timestamp, e.g.
+    ``chat-20260101-123456Z.json`` (the trailing ``Z`` marks UTC).
     """
     if not log_dir:
         return
-    path = os.path.join(log_dir, f"chat-{datetime.now():%Y%m%d-%H%M%S}.json")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(log_dir, f"chat-{ts}Z.json")
     os.makedirs(log_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(messages, fh, indent=2)

@@ -422,6 +422,7 @@ def _dump_transcript(log_dir: str, messages: Sequence[dict[str, Any]]) -> None:
     os.makedirs(log_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(messages, fh, indent=2)
+        fh.write("\n")
     print(f"[*] Transcript written to {path}")
 
 

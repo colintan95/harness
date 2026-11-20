@@ -593,6 +593,10 @@ def chat(
 
     with _signal_scope(_on_sigint):
         _first = True
+        # Track whether the user actually submitted at least one prompt, so a
+        # transcript is only written for a session that did something rather
+        # than for one that quit before any input.
+        _prompted = False
         while True:
             # Ring the bell when returning to the prompt after an agent turn.
             if not _first:
@@ -606,9 +610,11 @@ def chat(
                 prompt = _pt_session.prompt(">>> ").strip()
             except (KeyboardInterrupt, EOFError):
                 print()                 # move to a fresh line after the interrupt
-                # Persist the transcript when a log directory is configured;
-                # a no-op when LOG_DIR is unset.
-                _dump_transcript(log_dir, messages)
+                # Persist the transcript only when a log directory is configured
+                # and the user actually prompted something -- a no-op when
+                # LOG_DIR is unset or the session quit before any input.
+                if _prompted:
+                    _dump_transcript(log_dir, messages)
                 print()
                 return
 
@@ -616,6 +622,7 @@ def chat(
                 continue               # empty line: just prompt again
 
             messages.append({"role": "user", "content": prompt})
+            _prompted = True
             # Clear any stale cancel from a previous turn before a new one.
             loop["cancel"].clear()
 

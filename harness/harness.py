@@ -266,7 +266,12 @@ def _stream_turn(
 
     # stream=True + iter_lines(): Ollama emits NDJSON, one partial message
     # object per line, finished by a {"done": true} line.
-    print()  # blank line before the response
+    # The blank line that separates this response from the previous output is
+    # printed lazily -- just before the first chunk of thinking or content -- so
+    # that a turn which only requests a tool (and prints nothing itself) emits no
+    # stray blank line; the "Tokens:" separator in the caller is then the only
+    # blank line between the previous output and the count.
+    blank_printed = False
     try:
         with requests.post(
             f"{base_url}/api/chat",
@@ -287,10 +292,16 @@ def _stream_turn(
                 # print them in grey so they aren't confused with the answer.
                 thought = msg.get("thinking")
                 if thought:
+                    if not blank_printed:
+                        print()  # blank line before the response
+                        blank_printed = True
                     thinking.append(thought)
                     print(_grey(thought), end="", flush=True)
                 chunk = msg.get("content", "")
                 if chunk:
+                    if not blank_printed:
+                        print()  # blank line before the response
+                        blank_printed = True
                     # Move to a new line when transitioning from thinking to the
                     # actual response so they don't share a line.
                     if thinking and not content:
@@ -318,7 +329,11 @@ def _stream_turn(
             _Turn(content, thinking, tool_calls, total_tokens)
         ) from None
 
-    print()  # newline so the next prompt starts on a fresh line
+    # Close the line the streamed content/thinking left open so the caller's next
+    # output starts on a fresh line; a turn that streamed nothing prints nothing
+    # here, leaving the caller's "Tokens:" separator as the only blank line.
+    if content or thinking:
+        print()  # newline so the next prompt starts on a fresh line
     return _Turn(content, thinking, tool_calls, total_tokens)
 
 

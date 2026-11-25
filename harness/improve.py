@@ -58,7 +58,9 @@ from remote import (
 # as the /api/generate "system" field so the model stays in "analyst" mode
 # rather than treating the transcript as a task to continue.
 _ANALYZER_SYSTEM_PROMPT = """\
-Log is a message history of an AI agent. Find the pain points it had.
+Log is a message history of an AI agent. Find the pain points it had related to
+tool use that can probably be fixed by modifying the tool and suggestions on how to
+fix it.
 """
 
 # The transcript itself, framed as the thing to analyse.  The *log_text* slot
